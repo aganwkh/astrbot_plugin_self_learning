@@ -46,7 +46,9 @@ class RawMessageRepository(BaseRepository[RawMessage]):
             logger.error(f"[RawMessageRepository] 保存原始消息失败: {e}")
             return None
 
-    async def get_unprocessed(self, limit: int = 100) -> List[RawMessage]:
+    async def get_unprocessed(
+        self, limit: int = 100, group_id: Optional[str] = None
+    ) -> List[RawMessage]:
         """
         获取未处理的消息
 
@@ -60,9 +62,10 @@ class RawMessageRepository(BaseRepository[RawMessage]):
             stmt = (
                 select(RawMessage)
                 .where(RawMessage.processed == False)  # noqa: E712
-                .order_by(RawMessage.timestamp.asc())
-                .limit(limit)
             )
+            if group_id:
+                stmt = stmt.where(RawMessage.group_id == group_id)
+            stmt = stmt.order_by(RawMessage.timestamp.asc()).limit(limit)
             result = await self.session.execute(stmt)
             return list(result.scalars().all())
         except Exception as e:

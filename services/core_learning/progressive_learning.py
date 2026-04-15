@@ -231,7 +231,8 @@ class ProgressiveLearningService:
             else:
                 # 正常模式：只获取未处理的消息
                 unprocessed_messages = await self.message_collector.get_unprocessed_messages(
-                    limit=self.batch_size
+                    limit=self.batch_size,
+                    group_id=group_id,
                 )
 
             if not unprocessed_messages:
@@ -272,23 +273,12 @@ class ProgressiveLearningService:
 
             # 3. 获取当前人格设置 (针对特定群组)
             current_persona = await self._get_current_persona(group_id)
-            
-            # 4-7. 跳过LLM分析，仅记录消息统计
-            from ...core.interfaces import AnalysisResult
-
-            style_analysis = AnalysisResult(
-                success=True,
-                confidence=0.7,
-                data={
-                    'message_count': len(filtered_messages),
-                    'analysis_timestamp': datetime.now().isoformat(),
-                },
-                timestamp=time.time()
+            style_analysis, updated_persona = await self._build_learning_batch_artifacts(
+                group_id,
+                filtered_messages,
+                current_persona,
             )
-
-            # 不调用LLM生成更新后的人格，保持当前人格不变
-            updated_persona = current_persona.copy() if current_persona else {"prompt": ""}
-            ml_tuning_info = None
+            ml_tuning_info = self._extract_analysis_data(style_analysis).get("ml_tuning_info")
             
             # 8. 质量监控评估
             # 确保参数不为None，提供默认值
@@ -309,7 +299,28 @@ class ProgressiveLearningService:
             # 9. 应用学习更新（对话风格学习不判断质量直接应用，人格学习加入审查）
             # 注意：对话风格（表达模式）学习总是成功，人格学习在_apply_learning_updates中会加入审查
             # 传递 relearn_mode 和 ml_tuning_info 参数
-            await self._apply_learning_updates(group_id, style_analysis, filtered_messages, current_persona, updated_persona, quality_metrics, relearn_mode=relearn_mode, ml_tuning_info=ml_tuning_info)
+            apply_result = await self._apply_learning_updates(
+                group_id,
+                style_analysis,
+                filtered_messages,
+                current_persona,
+                updated_persona,
+                quality_metrics,
+                relearn_mode=relearn_mode,
+                ml_tuning_info=ml_tuning_info,
+            )
+            session_updates_written = await self._write_learning_session_updates(
+                group_id,
+                self._extract_analysis_data(style_analysis),
+            )
+            self._log_learning_batch_outcome(
+                group_id=group_id,
+                processed_count=len(unprocessed_messages),
+                filtered_count=len(filtered_messages),
+                analysis_data=self._extract_analysis_data(style_analysis),
+                persona_result=apply_result,
+                session_updates_written=session_updates_written,
+            )
             logger.info(f"学习更新已应用（对话风格学习已完成，人格学习已加入审查），质量得分: {quality_metrics.consistency_score:.3f} for group {group_id}")
             success = True # 对话风格学习总是成功
             
@@ -373,7 +384,8 @@ class ProgressiveLearningService:
             
             # 1. 异步获取数据
             unprocessed_messages = await self.message_collector.get_unprocessed_messages(
-                limit=self.batch_size
+                limit=self.batch_size,
+                group_id=group_id,
             )
             
             if not unprocessed_messages:
@@ -403,20 +415,11 @@ class ProgressiveLearningService:
                 await self._mark_messages_processed(unprocessed_messages)
                 return
             
-            # 3. 跳过LLM分析，仅记录消息统计
-            from ...core.interfaces import AnalysisResult
-
-            style_analysis = AnalysisResult(
-                success=True,
-                confidence=0.7,
-                data={
-                    'message_count': len(filtered_messages),
-                    'analysis_timestamp': datetime.now().isoformat(),
-                },
-                timestamp=time.time()
+            style_analysis, updated_persona = await self._build_learning_batch_artifacts(
+                group_id,
+                filtered_messages,
+                current_persona,
             )
-
-            updated_persona = current_persona.copy() if current_persona else {"prompt": ""}
 
             # 4. 质量评估和应用更新
             await self._finalize_learning_batch(
@@ -459,6 +462,349 @@ class ProgressiveLearningService:
             logger.error(f"后台增量微调失败: {e}")
             return {}
 
+    def _extract_analysis_data(self, style_analysis: Any) -> Dict[str, Any]:
+        """统一提取 style_analysis 负载。"""
+        if isinstance(style_analysis, dict):
+            return dict(style_analysis)
+        if hasattr(style_analysis, "data") and isinstance(style_analysis.data, dict):
+            return dict(style_analysis.data)
+        return {}
+
+    def _build_fallback_style_analysis(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """当 LLM 风格分析失败时，至少基于真实消息构建可消费的学习结果。"""
+        texts = [msg.get("message", "").strip() for msg in messages if msg.get("message")]
+        if not texts:
+            return {}
+
+        total_length = sum(len(text) for text in texts)
+        avg_length = total_length / max(len(texts), 1)
+        question_ratio = sum(1 for text in texts if "?" in text or "？" in text) / max(len(texts), 1)
+        exclamation_ratio = sum(1 for text in texts if "!" in text or "！" in text) / max(len(texts), 1)
+
+        common_phrases: List[str] = []
+        for text in texts:
+            snippet = text[:20]
+            if snippet and snippet not in common_phrases:
+                common_phrases.append(snippet)
+            if len(common_phrases) >= 5:
+                break
+
+        expression_features: List[str] = []
+        if avg_length >= 40:
+            expression_features.append("long_responses")
+        elif avg_length >= 15:
+            expression_features.append("medium_responses")
+        else:
+            expression_features.append("short_responses")
+
+        if question_ratio >= 0.3:
+            expression_features.append("question_driven")
+        if exclamation_ratio >= 0.2:
+            expression_features.append("emotionally_expressive")
+
+        tone = "balanced"
+        if exclamation_ratio >= 0.2:
+            tone = "enthusiastic"
+        elif question_ratio >= 0.3:
+            tone = "interactive"
+
+        return {
+            "text_style": f"style_summary_from_{len(texts)}_messages",
+            "expression_features": expression_features,
+            "tone": tone,
+            "topics": common_phrases[:3],
+            "common_phrases": common_phrases,
+        }
+
+    def _derive_style_attributes(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+        """从风格分析结果推导 PersonaUpdater 可直接消费的 style_attributes。"""
+        style_attributes: Dict[str, Any] = {}
+        style_report = analysis_data.get("style_analysis")
+        if isinstance(style_report, dict):
+            if style_report.get("tone"):
+                style_attributes["tone"] = style_report["tone"]
+            if style_report.get("emotion"):
+                style_attributes["emotion"] = style_report["emotion"]
+
+        style_profile = analysis_data.get("style_profile")
+        if isinstance(style_profile, dict):
+            formality_level = style_profile.get("formality_level")
+            if isinstance(formality_level, (int, float)):
+                if formality_level >= 0.6:
+                    style_attributes["formality"] = "formal"
+                elif formality_level <= 0.4:
+                    style_attributes["formality"] = "casual"
+
+            emotional_expression = style_profile.get("emotional_expression")
+            if isinstance(emotional_expression, (int, float)) and "emotion" not in style_attributes:
+                if emotional_expression >= 0.7:
+                    style_attributes["emotion"] = "high_expression"
+                elif emotional_expression <= 0.3:
+                    style_attributes["emotion"] = "restrained_expression"
+
+        return style_attributes
+
+    def _derive_style_features(self, analysis_data: Dict[str, Any]) -> List[str]:
+        """提取一组简洁的风格特征用于日志和 PersonaUpdater。"""
+        features: List[str] = []
+        style_report = analysis_data.get("style_analysis")
+        if isinstance(style_report, dict):
+            expression_features = style_report.get("expression_features")
+            if isinstance(expression_features, list):
+                features.extend(str(item) for item in expression_features[:5] if item)
+            elif isinstance(expression_features, str):
+                features.append(expression_features)
+
+            common_phrases = style_report.get("common_phrases")
+            if isinstance(common_phrases, list):
+                features.extend(f"common_phrase:{item}" for item in common_phrases[:3] if item)
+
+        deduped: List[str] = []
+        for feature in features:
+            if feature not in deduped:
+                deduped.append(feature)
+        return deduped[:8]
+
+    def _build_learning_insights(
+        self,
+        group_id: str,
+        messages: List[Dict[str, Any]],
+        analysis_data: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """构造 session_updates / 临时人格更新可复用的学习洞察。"""
+        style_report = analysis_data.get("style_analysis", {})
+        style_profile = analysis_data.get("style_profile", {})
+
+        interaction_patterns = "interaction_style_extracted_from_current_batch"
+        if isinstance(style_report, dict):
+            expression_features = style_report.get("expression_features")
+            if isinstance(expression_features, list) and expression_features:
+                interaction_patterns = ", ".join(str(item) for item in expression_features[:3])
+            elif style_report.get("text_style"):
+                interaction_patterns = str(style_report["text_style"])
+
+        effective_strategies = (
+            f"preserve_group_{group_id}_patterns_from_{len(messages)}_messages"
+        )
+        if isinstance(style_report, dict) and style_report.get("common_phrases"):
+            phrases = style_report["common_phrases"]
+            if isinstance(phrases, list) and phrases:
+                effective_strategies = "reuse_common_phrases: " + " / ".join(
+                    str(item) for item in phrases[:3]
+                )
+
+        improvement_suggestions = (
+            "merge_learned_style_into_future_persona_and_response_generation"
+        )
+        if isinstance(style_profile, dict) and isinstance(style_profile.get("vocabulary_richness"), (int, float)):
+            improvement_suggestions = (
+                "use_quantified_style_profile_to_adjust_wording_and_rhythm"
+            )
+
+        return {
+            "interaction_patterns": interaction_patterns,
+            "improvement_suggestions": improvement_suggestions,
+            "effective_strategies": effective_strategies,
+            "learning_focus": f"processed_{len(messages)}_messages_with_reusable_style_output",
+        }
+
+    def _has_generated_learning_content(self, analysis_data: Dict[str, Any]) -> bool:
+        return bool(
+            analysis_data.get("enhanced_prompt")
+            or analysis_data.get("learning_insights")
+            or analysis_data.get("style_analysis")
+        )
+
+    def _normalize_style_analysis_result(
+        self,
+        group_id: str,
+        style_analysis: Any,
+        messages: List[Dict[str, Any]],
+    ):
+        """确保 style_analysis 至少包含后续链路能消费的一种结构。"""
+        from ...core.interfaces import AnalysisResult
+
+        if isinstance(style_analysis, AnalysisResult):
+            success = style_analysis.success
+            confidence = style_analysis.confidence
+            timestamp = style_analysis.timestamp
+            error = style_analysis.error
+            analysis_data = self._extract_analysis_data(style_analysis)
+        elif isinstance(style_analysis, dict):
+            success = True
+            confidence = float(style_analysis.get("confidence", 0.6))
+            timestamp = time.time()
+            error = None
+            analysis_data = dict(style_analysis)
+        else:
+            success = False
+            confidence = 0.0
+            timestamp = time.time()
+            error = f"unexpected_style_analysis_type:{type(style_analysis)}"
+            analysis_data = {}
+
+        analysis_data.setdefault("message_count", len(messages))
+        analysis_data.setdefault("analysis_timestamp", datetime.now().isoformat())
+
+        if not analysis_data.get("style_analysis"):
+            fallback_style_analysis = self._build_fallback_style_analysis(messages)
+            if fallback_style_analysis:
+                analysis_data["style_analysis"] = fallback_style_analysis
+
+        if not analysis_data.get("learning_insights"):
+            analysis_data["learning_insights"] = self._build_learning_insights(
+                group_id,
+                messages,
+                analysis_data,
+            )
+
+        if not analysis_data.get("style_attributes"):
+            style_attributes = self._derive_style_attributes(analysis_data)
+            if style_attributes:
+                analysis_data["style_attributes"] = style_attributes
+
+        if not analysis_data.get("style_features"):
+            style_features = self._derive_style_features(analysis_data)
+            if style_features:
+                analysis_data["style_features"] = style_features
+
+        if not success and self._has_generated_learning_content(analysis_data):
+            success = True
+            error = None
+            confidence = max(confidence, 0.55)
+
+        return AnalysisResult(
+            success=success,
+            confidence=confidence,
+            data=analysis_data,
+            timestamp=timestamp,
+            error=error,
+        )
+
+    async def _build_learning_batch_artifacts(
+        self,
+        group_id: str,
+        filtered_messages: List[Dict[str, Any]],
+        current_persona: Optional[Dict[str, Any]],
+    ):
+        """执行真实风格分析并生成可落地的人格学习内容。"""
+        style_analysis = await self._execute_style_analysis_background(
+            group_id,
+            filtered_messages,
+        )
+        style_analysis = self._normalize_style_analysis_result(
+            group_id,
+            style_analysis,
+            filtered_messages,
+        )
+
+        base_persona = current_persona or {"prompt": "默认人格", "name": "default"}
+        updated_persona = await self._generate_updated_persona_with_refinement(
+            group_id,
+            base_persona,
+            style_analysis,
+        )
+        if not isinstance(updated_persona, dict):
+            logger.warning(f"更新后人格结构异常，回退为当前人格副本: {type(updated_persona)}")
+            updated_persona = dict(base_persona)
+
+        analysis_data = self._extract_analysis_data(style_analysis)
+        current_prompt = (base_persona or {}).get("prompt", "")
+        updated_prompt = updated_persona.get("prompt", "")
+        if updated_prompt and updated_prompt != current_prompt:
+            analysis_data["enhanced_prompt"] = updated_prompt
+
+        if not analysis_data.get("learning_insights"):
+            analysis_data["learning_insights"] = self._build_learning_insights(
+                group_id,
+                filtered_messages,
+                analysis_data,
+            )
+
+        style_analysis.data = analysis_data
+        logger.info(
+            f"[LearningBatch] group={group_id} "
+            f"style_analysis_success={style_analysis.success} "
+            f"generated_learning_content={self._has_generated_learning_content(analysis_data)} "
+            f"analysis_fields={list(analysis_data.keys())}"
+        )
+        return style_analysis, updated_persona
+
+    async def _write_learning_session_updates(
+        self,
+        group_id: str,
+        analysis_data: Dict[str, Any],
+    ) -> bool:
+        """尽量将学习洞察写入 session_updates，供 LLM Hook 注入。"""
+        temporary_persona_updater = getattr(self.ml_analyzer, "temporary_persona_updater", None)
+        learning_insights = analysis_data.get("learning_insights")
+
+        if not temporary_persona_updater:
+            logger.info(
+                f"[LearningBatch] group={group_id} session_updates_written=False "
+                "reason=temporary_persona_updater_unavailable"
+            )
+            return False
+
+        if not isinstance(learning_insights, dict) or not learning_insights:
+            logger.info(
+                f"[LearningBatch] group={group_id} session_updates_written=False "
+                "reason=no_learning_insights"
+            )
+            return False
+
+        try:
+            updates_bucket = getattr(temporary_persona_updater, "session_updates", None)
+            if not isinstance(updates_bucket, dict):
+                logger.info(
+                    f"[LearningBatch] group={group_id} session_updates_written=False "
+                    "reason=session_updates_bucket_unavailable"
+                )
+                return False
+
+            insight_text = (
+                f"[Learning Insights - {datetime.now().strftime('%Y-%m-%d %H:%M')}]\n"
+                f"- interaction_patterns: {learning_insights.get('interaction_patterns', 'n/a')}\n"
+                f"- improvement_suggestions: {learning_insights.get('improvement_suggestions', 'n/a')}\n"
+                f"- effective_strategies: {learning_insights.get('effective_strategies', 'n/a')}\n"
+                f"- learning_focus: {learning_insights.get('learning_focus', 'n/a')}"
+            )
+
+            if group_id not in updates_bucket:
+                updates_bucket[group_id] = []
+
+            if insight_text not in updates_bucket[group_id]:
+                updates_bucket[group_id].append(insight_text)
+
+            logger.info(
+                f"[LearningBatch] group={group_id} session_updates_written=True "
+                f"session_update_count={len(updates_bucket[group_id])}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[LearningBatch] 写入 session_updates 失败: {e}", exc_info=True)
+            return False
+
+    def _log_learning_batch_outcome(
+        self,
+        group_id: str,
+        processed_count: int,
+        filtered_count: int,
+        analysis_data: Dict[str, Any],
+        persona_result: Optional[Dict[str, Any]],
+        session_updates_written: bool,
+    ):
+        """输出批次级学习结果日志，便于确认是否真的学到了。"""
+        persona_result = persona_result or {}
+        logger.info(
+            f"[LearningBatch] group={group_id} processed_messages={processed_count} "
+            f"filtered_messages={filtered_count} "
+            f"generated_learning_content={self._has_generated_learning_content(analysis_data)} "
+            f"persona_applied={bool(persona_result.get('persona_update_applied'))} "
+            f"persona_review_written={bool(persona_result.get('persona_review_written'))} "
+            f"session_updates_written={session_updates_written}"
+        )
+
     async def _finalize_learning_batch(self, group_id: str, current_persona, updated_persona,
                                      filtered_messages, unprocessed_messages, batch_start_time, style_analysis=None):
         """完成学习批次的最终处理
@@ -486,8 +832,33 @@ class ProgressiveLearningService:
             # 如果 style_analysis 为 None，创建一个空的 AnalysisResult
             from ...core.interfaces import AnalysisResult
             if style_analysis is None:
-                style_analysis = AnalysisResult(success=True, confidence=0.5, data={})
-            await self._apply_learning_updates(group_id, style_analysis, filtered_messages, current_persona, updated_persona, quality_metrics, relearn_mode=False, ml_tuning_info=None)
+                style_analysis, updated_persona = await self._build_learning_batch_artifacts(
+                    group_id,
+                    filtered_messages,
+                    current_persona,
+                )
+            apply_result = await self._apply_learning_updates(
+                group_id,
+                style_analysis,
+                filtered_messages,
+                current_persona,
+                updated_persona,
+                quality_metrics,
+                relearn_mode=False,
+                ml_tuning_info=None,
+            )
+            session_updates_written = await self._write_learning_session_updates(
+                group_id,
+                self._extract_analysis_data(style_analysis),
+            )
+            self._log_learning_batch_outcome(
+                group_id=group_id,
+                processed_count=len(unprocessed_messages),
+                filtered_count=len(filtered_messages),
+                analysis_data=self._extract_analysis_data(style_analysis),
+                persona_result=apply_result,
+                session_updates_written=session_updates_written,
+            )
             logger.info(f"学习更新已应用（对话风格学习已完成，人格学习已加入审查），质量得分: {quality_metrics.consistency_score:.3f} for group {group_id}")
             success = True # 对话风格学习总是成功
 
@@ -524,7 +895,10 @@ class ProgressiveLearningService:
                 'quality_score': quality_metrics.consistency_score,
                 'learning_time': end_time - start_time,
                 'success': success,
-                'successful_pattern': json.dumps({}),
+                'successful_pattern': json.dumps(
+                    self._extract_analysis_data(style_analysis),
+                    default=self._json_serializer,
+                ),
                 'failed_pattern': '' # 对话风格学习总是成功，不记录失败
             })
             
@@ -857,13 +1231,20 @@ class ProgressiveLearningService:
 
             # 2. 更新人格prompt（通过 PersonaManagerService）
             logger.info(f"应用人格更新 for group {group_id}")
+            persona_update_applied = False
+            persona_review_written = False
+            persona_review_id = None
 
             # 正确处理 AnalysisResult 对象
             if hasattr(style_analysis, 'success'):
                 # 这是一个 AnalysisResult 对象
                 if not style_analysis.success:
                     logger.error(f"风格分析失败，跳过人格更新: {style_analysis.error}")
-                    return
+                    return {
+                        "persona_update_applied": False,
+                        "persona_review_written": False,
+                        "persona_review_id": None,
+                    }
 
                 # 使用 AnalysisResult 的 data 属性
                 style_analysis_dict = style_analysis.data
@@ -876,9 +1257,14 @@ class ProgressiveLearningService:
                 logger.debug("使用字典形式的 style_analysis（向后兼容）")
             else:
                 logger.error(f"style_analysis 类型不正确: {type(style_analysis)}")
-                return
+                return {
+                    "persona_update_applied": False,
+                    "persona_review_written": False,
+                    "persona_review_id": None,
+                }
 
             update_success = await self.persona_manager.update_persona(group_id, style_analysis_dict, messages)
+            persona_update_applied = bool(update_success)
             if not update_success:
                 logger.error(f"通过 PersonaManagerService 更新人格失败 for group {group_id}")
 
@@ -959,6 +1345,8 @@ class ProgressiveLearningService:
                         new_content=new_prompt # 完整新人格文本（original + incremental），用于审批应用
                     )
 
+                    persona_review_written = True
+                    persona_review_id = review_id
                     logger.info(f" 已创建人格学习审查记录 (ID: {review_id})，置信度: {confidence_score:.3f}")
 
                 except Exception as review_error:
@@ -970,8 +1358,19 @@ class ProgressiveLearningService:
             if group_id in self._group_sessions:
                 self._group_sessions[group_id].style_updates += 1
 
+            return {
+                "persona_update_applied": persona_update_applied,
+                "persona_review_written": persona_review_written,
+                "persona_review_id": persona_review_id,
+            }
+
         except Exception as e:
             logger.error(f"应用学习更新失败 for group {group_id}: {e}")
+            return {
+                "persona_update_applied": False,
+                "persona_review_written": False,
+                "persona_review_id": None,
+            }
 
     async def _mark_messages_processed(self, messages: List[Dict[str, Any]]):
         """标记消息为已处理"""

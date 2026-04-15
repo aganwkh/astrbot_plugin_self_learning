@@ -89,15 +89,27 @@ class StyleAnalyzerService:
         
         logger.info("风格分析服务初始化完成")
 
+    @staticmethod
+    def _get_profile_name(group_id: str) -> str:
+        """为群组生成稳定的风格画像键。"""
+        return f"{group_id}:baseline_style_profile"
+
     async def start(self):
         """服务启动时加载基准风格档案"""
         # 假设每个群组有独立的风格档案，这里需要一个 group_id
         # 为了简化，暂时假设加载一个默认的或全局的风格档案
         # 实际应用中，可能需要根据当前处理的群组ID来加载
         default_group_id = "global_style" # 或者从配置中获取
-        loaded_profile_data = await self.db_manager.load_style_profile(default_group_id, "baseline_style_profile")
+        loaded_profile_data = await self.db_manager.load_style_profile(
+            self._get_profile_name(default_group_id)
+        )
         if loaded_profile_data:
-            self.baseline_style = StyleProfile(**loaded_profile_data)
+            profile_payload = {
+                key: value
+                for key, value in loaded_profile_data.items()
+                if key != "profile_name"
+            }
+            self.baseline_style = StyleProfile(**profile_payload)
             logger.info("已从数据库加载基准风格档案。")
         else:
             logger.info("未找到基准风格档案，将从零开始。")
@@ -139,7 +151,10 @@ class StyleAnalyzerService:
             
             # 更新基准风格并持久化
             self.baseline_style = style_profile
-            await self.db_manager.save_style_profile(group_id, {"profile_name": "baseline_style_profile", **self.baseline_style.__dict__})
+            await self.db_manager.save_style_profile(
+                self._get_profile_name(group_id),
+                {"profile_name": "baseline_style_profile", **self.baseline_style.__dict__},
+            )
 
             # 计算置信度
             confidence = await self._calculate_analysis_confidence(messages)
@@ -241,7 +256,10 @@ class StyleAnalyzerService:
                         'group_id': group_id,
                         'last_updated': time.time()
                     }
-                    await self.db_manager.save_language_style_pattern(pattern_data)
+                    await self.db_manager.save_language_style_pattern(
+                        'common_expressions',
+                        pattern_data,
+                    )
             
             logger.info(f"风格分析结果已保存到数据库，群组: {group_id}")
             return True
