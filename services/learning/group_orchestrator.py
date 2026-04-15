@@ -113,6 +113,28 @@ class GroupLearningOrchestrator:
                     logger.info(f"群组 {group_id} 学习任务完成")
 
             learning_task.add_done_callback(_on_complete)
+            def _on_complete_with_result(task: asyncio.Task) -> None:
+                if task.cancelled() or task.exception():
+                    return
+
+                result = task.result() or self._build_task_result(
+                    success=False,
+                    reason="group_learning_result_missing",
+                )
+                log_method = logger.info if result.get("success") else logger.warning
+                log_method(
+                    f"[GroupLearningTask] group={group_id} success={result.get('success')} "
+                    f"generated_learning_content={result.get('generated_learning_content')} "
+                    f"persona_applied={result.get('persona_applied')} "
+                    f"persona_review_written={result.get('persona_review_written')} "
+                    f"session_updates_written={result.get('session_updates_written')} "
+                    f"processed_messages={result.get('processed_messages')} "
+                    f"filtered_messages={result.get('filtered_messages')} "
+                    f"degraded_mode={result.get('degraded_mode')} "
+                    f"reason={result.get('reason')}"
+                )
+
+            learning_task.add_done_callback(_on_complete_with_result)
             self.learning_tasks[group_id] = learning_task
             logger.info(f"为群组 {group_id} 启动了智能学习任务")
 
@@ -287,9 +309,34 @@ class GroupLearningOrchestrator:
             )
             return False
 
-    async def _start_group_learning(self, group_id: str) -> None:
+    async def _start_group_learning(self, group_id: str) -> Dict[str, Any]:
         """Start the progressive learning session for a single group."""
         try:
+            start_ok = await self._progressive_learning.start_learning(group_id)
+            if not start_ok:
+                logger.warning(f"[GroupLearningStart] group={group_id} success=False reason=progressive_learning_start_returned_false")
+                return self._build_task_result(
+                    success=False,
+                    reason="progressive_learning_start_returned_false",
+                )
+
+            result = await self._progressive_learning.wait_for_first_learning_result(
+                group_id,
+                timeout=120.0,
+            )
+            logger.info(
+                f"[GroupLearningStart] group={group_id} success={result.get('success')} "
+                f"generated_learning_content={result.get('generated_learning_content')} "
+                f"persona_applied={result.get('persona_applied')} "
+                f"persona_review_written={result.get('persona_review_written')} "
+                f"session_updates_written={result.get('session_updates_written')} "
+                f"processed_messages={result.get('processed_messages')} "
+                f"filtered_messages={result.get('filtered_messages')} "
+                f"degraded_mode={result.get('degraded_mode')} "
+                f"reason={result.get('reason')}"
+            )
+            return result
+
             success = await self._progressive_learning.start_learning(group_id)
             if success:
                 logger.info(f"群组 {group_id} 学习任务启动成功")
@@ -297,6 +344,37 @@ class GroupLearningOrchestrator:
                 logger.warning(f"群组 {group_id} 学习任务启动失败")
         except Exception as e:
             logger.error(f"群组 {group_id} 学习任务启动异常: {e}")
+
+            return self._build_task_result(
+                success=False,
+                degraded_mode=True,
+                reason=f"group_learning_start_exception:{e}",
+            )
+
+    def _build_task_result(
+        self,
+        *,
+        success: bool,
+        generated_learning_content: bool = False,
+        persona_applied: bool = False,
+        persona_review_written: bool = False,
+        session_updates_written: bool = False,
+        processed_messages: int = 0,
+        filtered_messages: int = 0,
+        degraded_mode: bool = False,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        return {
+            "success": bool(success),
+            "generated_learning_content": bool(generated_learning_content),
+            "persona_applied": bool(persona_applied),
+            "persona_review_written": bool(persona_review_written),
+            "session_updates_written": bool(session_updates_written),
+            "processed_messages": int(processed_messages or 0),
+            "filtered_messages": int(filtered_messages or 0),
+            "degraded_mode": bool(degraded_mode),
+            "reason": str(reason or ""),
+        }
 
     @staticmethod
     def _safe_int(

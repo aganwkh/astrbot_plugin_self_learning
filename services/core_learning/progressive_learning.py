@@ -65,6 +65,8 @@ class ProgressiveLearningService:
         self.update_system_prompt_callback = None
 
         self._group_sessions: Dict[str, LearningSession] = {}
+        self._latest_learning_results: Dict[str, Dict[str, Any]] = {}
+        self._first_batch_result_waiters: Dict[str, asyncio.Future] = {}
         self.learning_sessions: List[LearningSession] = [] # 历史学习会话，可以从数据库加载
         self.learning_lock = asyncio.Lock() # 添加异步锁防止竞态条件
 
@@ -102,6 +104,80 @@ class ProgressiveLearningService:
         # 如果需要加载历史会话，需要 DatabaseManager 提供 load_all_learning_sessions 方法
         logger.info("渐进式学习服务启动，准备开始学习。")
 
+    def _create_batch_result(
+        self,
+        *,
+        success: bool,
+        generated_learning_content: bool = False,
+        persona_applied: bool = False,
+        persona_review_written: bool = False,
+        session_updates_written: bool = False,
+        processed_messages: int = 0,
+        filtered_messages: int = 0,
+        degraded_mode: bool = False,
+        reason: str = "",
+        style_analysis_success: bool = False,
+    ) -> Dict[str, Any]:
+        return {
+            "success": bool(success),
+            "generated_learning_content": bool(generated_learning_content),
+            "persona_applied": bool(persona_applied),
+            "persona_review_written": bool(persona_review_written),
+            "session_updates_written": bool(session_updates_written),
+            "processed_messages": int(processed_messages or 0),
+            "filtered_messages": int(filtered_messages or 0),
+            "degraded_mode": bool(degraded_mode),
+            "reason": str(reason or ""),
+            "style_analysis_success": bool(style_analysis_success),
+        }
+
+    def _reset_first_batch_waiter(self, group_id: str) -> None:
+        existing_waiter = self._first_batch_result_waiters.pop(group_id, None)
+        if existing_waiter and not existing_waiter.done():
+            existing_waiter.cancel()
+
+        loop = asyncio.get_running_loop()
+        self._first_batch_result_waiters[group_id] = loop.create_future()
+        self._latest_learning_results.pop(group_id, None)
+
+    def _publish_learning_result(
+        self,
+        group_id: str,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        normalized_result = self._create_batch_result(**result)
+        self._latest_learning_results[group_id] = normalized_result
+
+        waiter = self._first_batch_result_waiters.get(group_id)
+        if waiter and not waiter.done():
+            waiter.set_result(normalized_result)
+
+        return normalized_result
+
+    async def wait_for_first_learning_result(
+        self,
+        group_id: str,
+        timeout: float = 120.0,
+    ) -> Dict[str, Any]:
+        existing_result = self._latest_learning_results.get(group_id)
+        if existing_result:
+            return existing_result
+
+        waiter = self._first_batch_result_waiters.get(group_id)
+        if not waiter:
+            return self._create_batch_result(
+                success=False,
+                reason="first_batch_result_waiter_missing",
+            )
+
+        try:
+            return await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
+        except asyncio.TimeoutError:
+            return self._create_batch_result(
+                success=False,
+                reason="first_batch_result_wait_timeout",
+            )
+
     async def start_learning(self, group_id: str) -> bool:
         """启动学习流程 - 优化为后台任务执行"""
         async with self.learning_lock: # 使用锁防止竞态条件
@@ -113,6 +189,7 @@ class ProgressiveLearningService:
                 
                 # 设置该群组为学习状态
                 self.learning_active[group_id] = True
+                self._reset_first_batch_waiter(group_id)
                 
                 # 创建新的学习会话
                 session_id = f"session_{group_id}_{int(time.time())}"
@@ -138,6 +215,28 @@ class ProgressiveLearningService:
                     self.learning_active[group_id] = False
                     
                 learning_task.add_done_callback(on_learning_complete)
+
+                def on_learning_complete_with_result(task):
+                    if task.cancelled() or task.exception():
+                        return
+
+                    result = self._latest_learning_results.get(group_id)
+                    if not result:
+                        return
+
+                    logger.info(
+                        f"[LearningTask] group={group_id} success={result.get('success')} "
+                        f"generated_learning_content={result.get('generated_learning_content')} "
+                        f"persona_applied={result.get('persona_applied')} "
+                        f"persona_review_written={result.get('persona_review_written')} "
+                        f"session_updates_written={result.get('session_updates_written')} "
+                        f"processed_messages={result.get('processed_messages')} "
+                        f"filtered_messages={result.get('filtered_messages')} "
+                        f"degraded_mode={result.get('degraded_mode')} "
+                        f"reason={result.get('reason')}"
+                    )
+
+                learning_task.add_done_callback(on_learning_complete_with_result)
                 
                 return True
                 
@@ -145,6 +244,13 @@ class ProgressiveLearningService:
                 logger.error(f"启动群组 {group_id} 学习失败: {e}")
                 # 确保清除学习状态
                 self.learning_active[group_id] = False
+                self._publish_learning_result(
+                    group_id,
+                    self._create_batch_result(
+                        success=False,
+                        reason=f"start_learning_failed:{e}",
+                    ),
+                )
                 return False
 
     async def stop_learning(self, group_id: str = None):
@@ -152,11 +258,28 @@ class ProgressiveLearningService:
         if group_id:
             # 停止特定群组的学习
             self.learning_active[group_id] = False
+            if group_id not in self._latest_learning_results:
+                self._publish_learning_result(
+                    group_id,
+                    self._create_batch_result(
+                        success=False,
+                        reason="learning_stopped_before_first_batch_result",
+                    ),
+                )
             logger.info(f"停止群组 {group_id} 的学习任务")
         else:
             # 停止所有群组的学习
             for gid in list(self.learning_active.keys()):
                 self.learning_active[gid] = False
+            for gid in list(self.learning_active.keys()):
+                if gid not in self._latest_learning_results:
+                    self._publish_learning_result(
+                        gid,
+                        self._create_batch_result(
+                            success=False,
+                            reason="learning_stopped_before_first_batch_result",
+                        ),
+                    )
             logger.info("停止所有群组的学习任务")
         
         if group_id:
@@ -178,26 +301,52 @@ class ProgressiveLearningService:
 
     async def _learning_loop_safe(self, group_id: str):
         """安全的学习循环 - 在后台线程执行，包含完整错误处理"""
+        last_result = self._latest_learning_results.get(group_id)
         try:
             while self.learning_active.get(group_id, False):
                 try:
                     # 检查是否应该暂停学习
                     should_pause, reason = await self.quality_monitor.should_pause_learning()
                     if should_pause:
+                        last_result = self._publish_learning_result(
+                            group_id,
+                            self._create_batch_result(
+                                success=False,
+                                degraded_mode=True,
+                                reason=f"learning_paused:{reason}",
+                            ),
+                        )
                         logger.warning(f"群组 {group_id} 学习被暂停: {reason}")
                         await self.stop_learning(group_id)
                         break
                     
                     # 执行一个学习批次 - 在后台执行
-                    await self._execute_learning_batch_background(group_id)
+                    batch_result = await self._execute_learning_batch_background(group_id)
+                    if isinstance(batch_result, dict):
+                        last_result = self._publish_learning_result(group_id, batch_result)
                     
                     # 等待下一个学习周期
                     await asyncio.sleep(self.learning_interval)
                     
                 except asyncio.CancelledError:
+                    last_result = self._publish_learning_result(
+                        group_id,
+                        self._create_batch_result(
+                            success=False,
+                            reason="learning_task_cancelled",
+                        ),
+                    )
                     logger.info(f"群组 {group_id} 学习任务被取消")
                     break
                 except Exception as e:
+                    last_result = self._publish_learning_result(
+                        group_id,
+                        self._create_batch_result(
+                            success=False,
+                            degraded_mode=True,
+                            reason=f"learning_loop_exception:{e}",
+                        ),
+                    )
                     logger.error(f"群组 {group_id} 学习循环异常: {e}", exc_info=True)
                     await asyncio.sleep(60) # 异常时等待1分钟
         finally:
@@ -207,6 +356,11 @@ class ProgressiveLearningService:
                 session.end_time = datetime.now().isoformat()
                 await self.db_manager.save_learning_session_record(group_id, session.__dict__)
             logger.info(f"学习循环结束 for group {group_id}")
+
+        return last_result or self._latest_learning_results.get(group_id) or self._create_batch_result(
+            success=False,
+            reason="learning_loop_finished_without_batch_result",
+        )
 
     async def _execute_learning_batch(self, group_id: str, relearn_mode: bool = False, from_force_learning: bool = False):
         """执行一个学习批次 - 集成强化学习
@@ -240,7 +394,12 @@ class ProgressiveLearningService:
                     logger.warning(f"群组 {group_id} 没有找到历史消息")
                 else:
                     logger.debug("没有未处理的消息，跳过此批次")
-                return
+                return self._create_batch_result(
+                    success=False,
+                    processed_messages=0,
+                    filtered_messages=0,
+                    reason="no_unprocessed_messages_for_learning_batch",
+                )
 
             logger.info(f"开始处理 {len(unprocessed_messages)} 条消息（relearn_mode={relearn_mode}）")
             
@@ -250,7 +409,12 @@ class ProgressiveLearningService:
             if not filtered_messages:
                 logger.debug("没有通过筛选的消息")
                 await self._mark_messages_processed(unprocessed_messages)
-                return
+                return self._create_batch_result(
+                    success=False,
+                    processed_messages=len(unprocessed_messages),
+                    filtered_messages=0,
+                    reason="no_messages_available_after_filtering",
+                )
 
             # 2.5 将筛选后的消息写入 FilteredMessage 表（供 WebUI 统计）
             saved_count = 0
@@ -313,28 +477,36 @@ class ProgressiveLearningService:
                 group_id,
                 self._extract_analysis_data(style_analysis),
             )
-            self._log_learning_batch_outcome(
-                group_id=group_id,
+            analysis_data = self._extract_analysis_data(style_analysis)
+            batch_result = self._build_learning_batch_result(
                 processed_count=len(unprocessed_messages),
                 filtered_count=len(filtered_messages),
-                analysis_data=self._extract_analysis_data(style_analysis),
+                analysis_data=analysis_data,
                 persona_result=apply_result,
                 session_updates_written=session_updates_written,
             )
+            self._log_learning_batch_outcome(
+                group_id=group_id,
+                batch_result=batch_result,
+            )
             logger.info(f"学习更新已应用（对话风格学习已完成，人格学习已加入审查），质量得分: {quality_metrics.consistency_score:.3f} for group {group_id}")
-            success = True # 对话风格学习总是成功
+            success = batch_result["success"]
             
             # 10. 【新增】保存学习性能记录
             # 正确处理 AnalysisResult 对象进行序列化
             style_analysis_for_db = style_analysis.data if hasattr(style_analysis, 'data') else style_analysis
+            successful_pattern, failed_pattern = self._build_learning_pattern_payload(
+                analysis_data,
+                batch_result,
+            )
             await self.db_manager.save_learning_performance_record(group_id, {
                 'session_id': self._group_sessions[group_id].session_id if group_id in self._group_sessions else '',
                 'timestamp': time.time(),
                 'quality_score': quality_metrics.consistency_score,
                 'learning_time': (datetime.now() - batch_start_time).total_seconds(),
                 'success': success,
-                'successful_pattern': json.dumps(style_analysis_for_db, default=self._json_serializer),
-                'failed_pattern': '' # 对话风格学习总是成功，不记录失败
+                'successful_pattern': successful_pattern,
+                'failed_pattern': failed_pattern,
             })
             
             # 11. 标记消息为已处理
@@ -373,6 +545,11 @@ class ProgressiveLearningService:
             batch_duration = (datetime.now() - batch_start_time).total_seconds()
             logger.info(f"学习批次完成，耗时: {batch_duration:.2f}秒")
             
+            return self._create_batch_result(
+                success=False,
+                degraded_mode=True,
+                reason=f"finalize_learning_batch_exception:{e}",
+            )
         except Exception as e:
             logger.error(f"学习批次执行失败: {e}")
             raise LearningError(f"学习批次执行失败: {str(e)}")
@@ -390,7 +567,12 @@ class ProgressiveLearningService:
             
             if not unprocessed_messages:
                 logger.debug("没有未处理的消息，跳过此批次")
-                return
+                return self._create_batch_result(
+                    success=False,
+                    processed_messages=0,
+                    filtered_messages=0,
+                    reason="no_unprocessed_messages_for_background_batch",
+                )
             
             logger.info(f"开始后台处理 {len(unprocessed_messages)} 条消息")
             
@@ -413,7 +595,12 @@ class ProgressiveLearningService:
             if not filtered_messages:
                 logger.debug("没有通过筛选的消息")
                 await self._mark_messages_processed(unprocessed_messages)
-                return
+                return self._create_batch_result(
+                    success=False,
+                    processed_messages=len(unprocessed_messages),
+                    filtered_messages=0,
+                    reason="no_messages_available_after_background_filtering",
+                )
             
             style_analysis, updated_persona = await self._build_learning_batch_artifacts(
                 group_id,
@@ -422,13 +609,19 @@ class ProgressiveLearningService:
             )
 
             # 4. 质量评估和应用更新
-            await self._finalize_learning_batch(
+            return await self._finalize_learning_batch(
                 group_id, current_persona, updated_persona, filtered_messages,
                 unprocessed_messages, batch_start_time, style_analysis # 传递 style_analysis
             )
             
         except Exception as e:
             logger.error(f"后台学习批次执行失败: {e}", exc_info=True)
+
+            return self._create_batch_result(
+                success=False,
+                degraded_mode=True,
+                reason=f"background_learning_batch_exception:{e}",
+            )
 
     async def _execute_reinforcement_learning_background(self, group_id: str, filtered_messages, current_persona):
         """在后台执行强化学习"""
@@ -615,6 +808,132 @@ class ProgressiveLearningService:
             or analysis_data.get("style_analysis")
         )
 
+    def _compose_learning_reason(
+        self,
+        analysis_data: Dict[str, Any],
+        generated_learning_content: bool,
+    ) -> str:
+        reasons: List[str] = []
+
+        filtering_detail = analysis_data.get("filtering_detail")
+        if filtering_detail:
+            reasons.append(str(filtering_detail))
+
+        degraded_reason = analysis_data.get("degraded_reason")
+        if degraded_reason:
+            reasons.append(str(degraded_reason))
+
+        reason = analysis_data.get("reason")
+        if reason:
+            reasons.append(str(reason))
+
+        if not generated_learning_content:
+            reasons.append("no_learning_content_generated")
+
+        if generated_learning_content and not reasons:
+            reasons.append("learning_content_generated")
+
+        deduped_reasons: List[str] = []
+        for item in reasons:
+            if item and item not in deduped_reasons:
+                deduped_reasons.append(item)
+        return "; ".join(deduped_reasons)
+
+    def _build_learning_batch_result(
+        self,
+        *,
+        processed_count: int,
+        filtered_count: int,
+        analysis_data: Dict[str, Any],
+        persona_result: Optional[Dict[str, Any]],
+        session_updates_written: bool,
+    ) -> Dict[str, Any]:
+        persona_result = persona_result or {}
+        generated_learning_content = self._has_generated_learning_content(analysis_data)
+        persona_applied = bool(persona_result.get("persona_update_applied"))
+        persona_review_written = bool(persona_result.get("persona_review_written"))
+        style_analysis_success = bool(
+            analysis_data.get("style_analysis_success", analysis_data.get("style_analysis"))
+        )
+        degraded_mode = bool(analysis_data.get("degraded_mode"))
+        reason = self._compose_learning_reason(analysis_data, generated_learning_content)
+
+        return self._create_batch_result(
+            success=bool(
+                generated_learning_content
+                or persona_applied
+                or persona_review_written
+                or session_updates_written
+            ),
+            generated_learning_content=generated_learning_content,
+            persona_applied=persona_applied,
+            persona_review_written=persona_review_written,
+            session_updates_written=session_updates_written,
+            processed_messages=processed_count,
+            filtered_messages=filtered_count,
+            degraded_mode=degraded_mode,
+            reason=reason,
+            style_analysis_success=style_analysis_success,
+        )
+
+    def _build_learning_pattern_payload(
+        self,
+        analysis_data: Dict[str, Any],
+        batch_result: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        key_summary = {
+            "style_analysis_success": batch_result.get("style_analysis_success", False),
+            "generated_learning_content": batch_result.get("generated_learning_content", False),
+            "persona_applied": batch_result.get("persona_applied", False),
+            "persona_review_written": batch_result.get("persona_review_written", False),
+            "session_updates_written": batch_result.get("session_updates_written", False),
+            "processed_messages": batch_result.get("processed_messages", 0),
+            "filtered_messages": batch_result.get("filtered_messages", 0),
+            "degraded_mode": batch_result.get("degraded_mode", False),
+            "reason": batch_result.get("reason", ""),
+            "style_features": analysis_data.get("style_features", []),
+            "message_count": analysis_data.get("message_count", 0),
+        }
+
+        successful_pattern: Dict[str, Any] = {}
+        failed_pattern: Dict[str, Any] = {}
+
+        if batch_result.get("generated_learning_content"):
+            for field in ("style_analysis", "learning_insights", "enhanced_prompt"):
+                value = analysis_data.get(field)
+                if value:
+                    successful_pattern[field] = value
+            successful_pattern["key_summary"] = key_summary
+        else:
+            failed_pattern = dict(key_summary)
+
+        return successful_pattern, failed_pattern
+
+    async def _save_learning_performance(
+        self,
+        group_id: str,
+        quality_score: float,
+        learning_time: float,
+        analysis_data: Dict[str, Any],
+        batch_result: Dict[str, Any],
+    ) -> None:
+        successful_pattern, failed_pattern = self._build_learning_pattern_payload(
+            analysis_data,
+            batch_result,
+        )
+        await self.db_manager.save_learning_performance_record(
+            group_id,
+            {
+                "session_id": self._group_sessions[group_id].session_id if group_id in self._group_sessions else "",
+                "timestamp": time.time(),
+                "quality_score": quality_score,
+                "learning_time": learning_time,
+                "success": batch_result.get("success", False),
+                "successful_pattern": successful_pattern,
+                "failed_pattern": failed_pattern,
+            },
+        )
+
     def _normalize_style_analysis_result(
         self,
         group_id: str,
@@ -631,7 +950,7 @@ class ProgressiveLearningService:
             error = style_analysis.error
             analysis_data = self._extract_analysis_data(style_analysis)
         elif isinstance(style_analysis, dict):
-            success = True
+            success = batch_result["success"]
             confidence = float(style_analysis.get("confidence", 0.6))
             timestamp = time.time()
             error = None
@@ -643,13 +962,25 @@ class ProgressiveLearningService:
             error = f"unexpected_style_analysis_type:{type(style_analysis)}"
             analysis_data = {}
 
+        raw_style_analysis_success = bool(success)
         analysis_data.setdefault("message_count", len(messages))
         analysis_data.setdefault("analysis_timestamp", datetime.now().isoformat())
+        analysis_data.setdefault("style_analysis_success", raw_style_analysis_success)
+        analysis_data.setdefault("degraded_mode", False)
+
+        if error:
+            analysis_data["degraded_mode"] = True
+            analysis_data.setdefault("degraded_reason", f"style_analysis_error:{error}")
 
         if not analysis_data.get("style_analysis"):
             fallback_style_analysis = self._build_fallback_style_analysis(messages)
             if fallback_style_analysis:
                 analysis_data["style_analysis"] = fallback_style_analysis
+                analysis_data["degraded_mode"] = True
+                analysis_data.setdefault(
+                    "degraded_reason",
+                    "style_analysis_missing_use_message_derived_fallback",
+                )
 
         if not analysis_data.get("learning_insights"):
             analysis_data["learning_insights"] = self._build_learning_insights(
@@ -670,7 +1001,6 @@ class ProgressiveLearningService:
 
         if not success and self._has_generated_learning_content(analysis_data):
             success = True
-            error = None
             confidence = max(confidence, 0.55)
 
         return AnalysisResult(
@@ -709,6 +1039,24 @@ class ProgressiveLearningService:
             updated_persona = dict(base_persona)
 
         analysis_data = self._extract_analysis_data(style_analysis)
+        filter_reasons = [
+            msg.get("filter_reason")
+            for msg in filtered_messages
+            if isinstance(msg, dict) and msg.get("filter_reason")
+        ]
+        if filter_reasons:
+            analysis_data["filtering_reason"] = filter_reasons[0]
+            if filter_reasons[0] == "style_learning_no_filter":
+                analysis_data["filtering_detail"] = (
+                    "style_learning_uses_raw_messages_without_llm_filter_by_design"
+                )
+        filter_details = [
+            msg.get("filter_detail")
+            for msg in filtered_messages
+            if isinstance(msg, dict) and msg.get("filter_detail")
+        ]
+        if filter_details:
+            analysis_data["filtering_detail"] = filter_details[0]
         current_prompt = (base_persona or {}).get("prompt", "")
         updated_prompt = updated_persona.get("prompt", "")
         if updated_prompt and updated_prompt != current_prompt:
@@ -724,8 +1072,10 @@ class ProgressiveLearningService:
         style_analysis.data = analysis_data
         logger.info(
             f"[LearningBatch] group={group_id} "
-            f"style_analysis_success={style_analysis.success} "
+            f"style_analysis_success={analysis_data.get('style_analysis_success', style_analysis.success)} "
             f"generated_learning_content={self._has_generated_learning_content(analysis_data)} "
+            f"degraded_mode={analysis_data.get('degraded_mode', False)} "
+            f"reason={self._compose_learning_reason(analysis_data, self._has_generated_learning_content(analysis_data))} "
             f"analysis_fields={list(analysis_data.keys())}"
         )
         return style_analysis, updated_persona
@@ -788,21 +1138,20 @@ class ProgressiveLearningService:
     def _log_learning_batch_outcome(
         self,
         group_id: str,
-        processed_count: int,
-        filtered_count: int,
-        analysis_data: Dict[str, Any],
-        persona_result: Optional[Dict[str, Any]],
-        session_updates_written: bool,
+        batch_result: Dict[str, Any],
     ):
         """输出批次级学习结果日志，便于确认是否真的学到了。"""
-        persona_result = persona_result or {}
         logger.info(
-            f"[LearningBatch] group={group_id} processed_messages={processed_count} "
-            f"filtered_messages={filtered_count} "
-            f"generated_learning_content={self._has_generated_learning_content(analysis_data)} "
-            f"persona_applied={bool(persona_result.get('persona_update_applied'))} "
-            f"persona_review_written={bool(persona_result.get('persona_review_written'))} "
-            f"session_updates_written={session_updates_written}"
+            f"[LearningBatch] group={group_id} "
+            f"style_analysis_success={batch_result.get('style_analysis_success', False)} "
+            f"generated_learning_content={batch_result.get('generated_learning_content', False)} "
+            f"persona_applied={batch_result.get('persona_applied', False)} "
+            f"persona_review_written={batch_result.get('persona_review_written', False)} "
+            f"session_updates_written={batch_result.get('session_updates_written', False)} "
+            f"processed_messages={batch_result.get('processed_messages', 0)} "
+            f"filtered_messages={batch_result.get('filtered_messages', 0)} "
+            f"degraded_mode={batch_result.get('degraded_mode', False)} "
+            f"reason={batch_result.get('reason', '')}"
         )
 
     async def _finalize_learning_batch(self, group_id: str, current_persona, updated_persona,
@@ -851,16 +1200,20 @@ class ProgressiveLearningService:
                 group_id,
                 self._extract_analysis_data(style_analysis),
             )
-            self._log_learning_batch_outcome(
-                group_id=group_id,
+            analysis_data = self._extract_analysis_data(style_analysis)
+            batch_result = self._build_learning_batch_result(
                 processed_count=len(unprocessed_messages),
                 filtered_count=len(filtered_messages),
-                analysis_data=self._extract_analysis_data(style_analysis),
+                analysis_data=analysis_data,
                 persona_result=apply_result,
                 session_updates_written=session_updates_written,
             )
+            self._log_learning_batch_outcome(
+                group_id=group_id,
+                batch_result=batch_result,
+            )
             logger.info(f"学习更新已应用（对话风格学习已完成，人格学习已加入审查），质量得分: {quality_metrics.consistency_score:.3f} for group {group_id}")
-            success = True # 对话风格学习总是成功
+            success = batch_result["success"]
 
             # 记录学习批次到数据库（使用 ORM）
             try:
@@ -889,17 +1242,18 @@ class ProgressiveLearningService:
                 logger.debug(f"无法记录学习批次（不影响学习功能）: {e}")
 
             # 保存学习性能记录
+            successful_pattern, failed_pattern = self._build_learning_pattern_payload(
+                analysis_data,
+                batch_result,
+            )
             await self.db_manager.save_learning_performance_record(group_id, {
                 'session_id': self._group_sessions[group_id].session_id if group_id in self._group_sessions else '',
                 'timestamp': time.time(),
                 'quality_score': quality_metrics.consistency_score,
                 'learning_time': end_time - start_time,
                 'success': success,
-                'successful_pattern': json.dumps(
-                    self._extract_analysis_data(style_analysis),
-                    default=self._json_serializer,
-                ),
-                'failed_pattern': '' # 对话风格学习总是成功，不记录失败
+                'successful_pattern': successful_pattern,
+                'failed_pattern': failed_pattern,
             })
             
             # 标记消息为已处理
@@ -919,10 +1273,24 @@ class ProgressiveLearningService:
                 asyncio.create_task(self._execute_strategy_optimization_background(group_id))
             
             batch_duration = end_time - start_time
+            return batch_result
             logger.info(f"后台学习批次完成，耗时: {batch_duration:.2f}秒")
             
         except Exception as e:
             logger.error(f"完成学习批次失败: {e}")
+
+            return self._create_batch_result(
+                success=False,
+                degraded_mode=True,
+                reason=f"finalize_learning_batch_exception:{e}",
+            )
+        except Exception as e:
+            logger.error(f"瀹屾垚瀛︿範鎵規澶辫触: {e}")
+            return self._create_batch_result(
+                success=False,
+                degraded_mode=True,
+                reason=f"finalize_learning_batch_exception:{e}",
+            )
 
     async def _execute_strategy_optimization_background(self, group_id: str):
         """在后台执行策略优化，不阻塞主流程"""
@@ -1022,12 +1390,16 @@ class ProgressiveLearningService:
         """对话风格学习不需要筛选，直接返回所有消息"""
 
         # 对话风格学习不需要LLM筛选，直接学习所有原始消息
-        logger.info(f"对话风格学习模式：直接学习 {len(messages)} 条原始消息（跳过LLM筛选）")
+        logger.info(
+            f"[LearningBatch] filter_mode=direct_raw_messages message_count={len(messages)} "
+            "skip_llm_filter=True reason=style_learning_uses_raw_messages_without_llm_filter_by_design"
+        )
 
         # 为每条消息添加默认的相关性评分
         for message in messages:
             message['relevance_score'] = 1.0 # 默认完全相关
             message['filter_reason'] = 'style_learning_no_filter'
+            message['filter_detail'] = 'style_learning_uses_raw_messages_without_llm_filter_by_design'
 
         return messages
 
