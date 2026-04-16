@@ -45,6 +45,10 @@ class GroupLearningOrchestrator:
         self._last_learning_start: Dict[str, float] = {}
         # Groups whose timestamps have already been loaded from DB
         self._loaded_groups: set = set()
+        # Groups that already completed at least one successful learning batch
+        self._groups_with_successful_learning: set = set()
+        # Groups whose success state has already been loaded from DB
+        self._loaded_success_groups: set = set()
 
     # Public API
 
@@ -52,29 +56,134 @@ class GroupLearningOrchestrator:
         """Smart-start a learning task for *group_id* with frequency throttling."""
         try:
             if group_id in self.learning_tasks:
+                logger.info(
+                    f"[LearningGate] group={group_id} decision=skip reason=already_running"
+                )
                 return
 
             # 懒加载: 从数据库恢复上次学习时间戳（每个群仅查询一次）
             if group_id not in self._loaded_groups:
                 if await self._load_last_learning_ts(group_id):
                     self._loaded_groups.add(group_id)
+                    logger.debug(
+                        f"[LearningGate] group={group_id} loaded_last_learning_ts_from_db"
+                    )
 
+            has_successful_learning = await self._load_successful_learning_state(group_id)
             current_time = time.time()
             last_start = self._last_learning_start.get(group_id, 0)
             interval_seconds = self._config.learning_interval_hours * 3600
 
+            if not has_successful_learning:
+                stats = await self._message_collector.get_statistics(group_id)
+                if not isinstance(stats, dict):
+                    logger.warning(
+                        f"[LearningGate] group={group_id} decision=skip "
+                        f"reason=statistics_type_invalid stats_type={type(stats)} stats_value={stats}"
+                    )
+                    return
+
+                unprocessed_count = self._safe_int(
+                    stats.get("unprocessed_messages", 0), "unprocessed_messages"
+                )
+                if unprocessed_count is None:
+                    logger.warning(
+                        f"[LearningGate] group={group_id} decision=skip "
+                        f"reason=unprocessed_count_invalid"
+                    )
+                    return
+
+                min_messages = self._safe_int(
+                    self._config.min_messages_for_learning,
+                    "min_messages_for_learning",
+                    default=10,
+                )
+                warmup_min_messages = max(5, min(10, min_messages))
+
+                logger.info(
+                    f"[LearningGate] group={group_id} candidate "
+                    f"successful_learning={has_successful_learning} "
+                    f"raw_messages={stats.get('raw_messages', 0)} "
+                    f"unprocessed_messages={unprocessed_count} "
+                    f"warmup_min_messages={warmup_min_messages} "
+                    f"min_messages={min_messages} "
+                    f"last_start={last_start:.0f}"
+                )
+
+                if unprocessed_count < warmup_min_messages:
+                    logger.info(
+                        f"[LearningGate] group={group_id} decision=below_threshold "
+                        f"mode=first_warmup unprocessed_messages={unprocessed_count} "
+                        f"threshold={warmup_min_messages}"
+                    )
+                    return
+
+                self._last_learning_start[group_id] = current_time
+                logger.info(
+                    f"[LearningGate] group={group_id} decision=start_first_warmup "
+                    f"unprocessed_messages={unprocessed_count} "
+                    f"threshold={warmup_min_messages}"
+                )
+                learning_task = asyncio.create_task(
+                    self._start_group_learning(group_id)
+                )
+
+                def _on_complete(task: asyncio.Task) -> None:
+                    self.learning_tasks.pop(group_id, None)
+                    if task.exception():
+                        logger.error(
+                            f"缇ょ粍 {group_id} 瀛︿範浠诲姟寮傚父: {task.exception()}"
+                        )
+                    else:
+                        logger.info(f"缇ょ粍 {group_id} 瀛︿範浠诲姟瀹屾垚")
+
+                def _on_complete_with_result(task: asyncio.Task) -> None:
+                    if task.cancelled() or task.exception():
+                        return
+
+                    result = task.result() or self._build_task_result(
+                        success=False,
+                        reason="group_learning_result_missing",
+                    )
+                    if result.get("success"):
+                        self._groups_with_successful_learning.add(group_id)
+                        self._loaded_success_groups.add(group_id)
+                        logger.info(
+                            f"[LearningGate] group={group_id} success_state_recorded=True"
+                        )
+                    log_method = logger.info if result.get("success") else logger.warning
+                    log_method(
+                        f"[GroupLearningTask] group={group_id} success={result.get('success')} "
+                        f"generated_learning_content={result.get('generated_learning_content')} "
+                        f"persona_applied={result.get('persona_applied')} "
+                        f"persona_review_written={result.get('persona_review_written')} "
+                        f"session_updates_written={result.get('session_updates_written')} "
+                        f"processed_messages={result.get('processed_messages')} "
+                        f"filtered_messages={result.get('filtered_messages')} "
+                        f"degraded_mode={result.get('degraded_mode')} "
+                        f"reason={result.get('reason')}"
+                    )
+
+                learning_task.add_done_callback(_on_complete)
+                learning_task.add_done_callback(_on_complete_with_result)
+                self.learning_tasks[group_id] = learning_task
+                logger.info(f"涓虹兢缁?{group_id} 鍚姩浜嗘櫤鑳藉涔犱换鍔?")
+                return
+
             if current_time - last_start < interval_seconds:
                 remaining = interval_seconds - (current_time - last_start)
-                logger.debug(
-                    f"群组 {group_id} 学习间隔未到，剩余时间: {remaining / 60:.1f}分钟"
+                logger.info(
+                    f"[LearningGate] group={group_id} decision=skip reason=interval_not_met "
+                    f"remaining_minutes={remaining / 60:.1f} "
+                    f"interval_hours={self._config.learning_interval_hours}"
                 )
                 return
 
             stats = await self._message_collector.get_statistics(group_id)
             if not isinstance(stats, dict):
                 logger.warning(
-                    f"get_statistics 返回了非字典类型: {type(stats)}, "
-                    f"值: {stats}, 跳过学习启动"
+                    f"[LearningGate] group={group_id} decision=skip "
+                    f"reason=statistics_type_invalid stats_type={type(stats)} stats_value={stats}"
                 )
                 return
 
@@ -82,6 +191,10 @@ class GroupLearningOrchestrator:
                 stats.get("unprocessed_messages", 0), "unprocessed_messages"
             )
             if unprocessed_count is None:
+                logger.warning(
+                    f"[LearningGate] group={group_id} decision=skip "
+                    f"reason=unprocessed_count_invalid"
+                )
                 return
 
             min_messages = self._safe_int(
@@ -90,15 +203,27 @@ class GroupLearningOrchestrator:
                 default=10,
             )
 
+            logger.info(
+                f"[LearningGate] group={group_id} candidate "
+                f"raw_messages={stats.get('raw_messages', 0)} "
+                f"unprocessed_messages={unprocessed_count} "
+                f"min_messages={min_messages} "
+                f"last_start={last_start:.0f}"
+            )
+
             if unprocessed_count < min_messages:
-                logger.debug(
-                    f"群组 {group_id} 未处理消息数量未达到学习阈值: "
-                    f"{unprocessed_count}/{min_messages}"
+                logger.info(
+                    f"[LearningGate] group={group_id} decision=skip reason=below_threshold "
+                    f"unprocessed_messages={unprocessed_count} min_messages={min_messages}"
                 )
                 return
 
             self._last_learning_start[group_id] = current_time
 
+            logger.info(
+                f"[LearningGate] group={group_id} decision=start "
+                f"unprocessed_messages={unprocessed_count} min_messages={min_messages}"
+            )
             learning_task = asyncio.create_task(
                 self._start_group_learning(group_id)
             )
@@ -121,6 +246,12 @@ class GroupLearningOrchestrator:
                     success=False,
                     reason="group_learning_result_missing",
                 )
+                if result.get("success"):
+                    self._groups_with_successful_learning.add(group_id)
+                    self._loaded_success_groups.add(group_id)
+                    logger.info(
+                        f"[LearningGate] group={group_id} success_state_recorded=True"
+                    )
                 log_method = logger.info if result.get("success") else logger.warning
                 log_method(
                     f"[GroupLearningTask] group={group_id} success={result.get('success')} "
@@ -306,6 +437,33 @@ class GroupLearningOrchestrator:
         except Exception as e:
             logger.debug(
                 f"从数据库加载群组 {group_id} 学习时间失败 (回退到内存): {e}"
+            )
+            return False
+
+    async def _load_successful_learning_state(self, group_id: str) -> bool:
+        """Load whether *group_id* already has any successful learning batches."""
+        if group_id in self._loaded_success_groups:
+            return group_id in self._groups_with_successful_learning
+
+        if not self._db_ready():
+            return False
+
+        try:
+            history = await self._db_manager.get_learning_performance_history(
+                group_id=group_id, limit=500
+            )
+            has_success = any(bool(item.get("success")) for item in history)
+            if has_success:
+                self._groups_with_successful_learning.add(group_id)
+            self._loaded_success_groups.add(group_id)
+            logger.debug(
+                f"[LearningGate] group={group_id} loaded_success_state "
+                f"has_successful_learning={has_success} history_count={len(history)}"
+            )
+            return has_success
+        except Exception as e:
+            logger.debug(
+                f"[LearningGate] group={group_id} load_success_state_failed error={e}"
             )
             return False
 

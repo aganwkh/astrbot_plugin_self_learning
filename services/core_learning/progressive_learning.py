@@ -77,6 +77,216 @@ class ProgressiveLearningService:
 
         logger.info("渐进式学习服务初始化完成")
 
+    def _get_refine_timeout_seconds(self) -> float:
+        timeout = getattr(self.config, "refine_timeout_seconds", None)
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            return float(timeout)
+        return 45.0
+
+    def _get_refine_retry_count(self) -> int:
+        retry_count = getattr(self.config, "refine_retry_count", 1)
+        try:
+            return max(0, int(retry_count))
+        except (TypeError, ValueError):
+            return 1
+
+    def _get_refine_recent_message_limit(self) -> int:
+        configured_limit = getattr(self.config, "refine_recent_message_limit", None)
+        if isinstance(configured_limit, int) and configured_limit > 0:
+            return max(5, min(configured_limit, 30))
+
+        batch_size = getattr(self, "batch_size", 50) or 50
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            batch_size = 50
+
+        return max(20, min(30, max(20, batch_size // 2 or 20)))
+
+    def _compact_refine_value(
+        self,
+        value: Any,
+        *,
+        max_depth: int = 2,
+        max_items: int = 6,
+        max_str_len: int = 500,
+    ) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value if len(value) <= max_str_len else value[:max_str_len] + "...<truncated>"
+        if isinstance(value, (int, float, bool)):
+            return value
+        if max_depth <= 0:
+            return str(value)[:max_str_len]
+        if isinstance(value, list):
+            return [
+                self._compact_refine_value(
+                    item,
+                    max_depth=max_depth - 1,
+                    max_items=max_items,
+                    max_str_len=max_str_len,
+                )
+                for item in value[:max_items]
+            ]
+        if isinstance(value, dict):
+            compacted: Dict[str, Any] = {}
+            for key, item in list(value.items())[:max_items]:
+                compacted[key] = self._compact_refine_value(
+                    item,
+                    max_depth=max_depth - 1,
+                    max_items=max_items,
+                    max_str_len=max_str_len,
+                )
+            return compacted
+        return str(value)[:max_str_len]
+
+    def _build_recent_messages_refine_payload(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        filtered_messages = [msg for msg in messages if isinstance(msg, dict)]
+        ordered_messages = sorted(filtered_messages, key=lambda item: item.get("timestamp", 0))
+        recent_limit = limit or self._get_refine_recent_message_limit()
+        recent_messages = ordered_messages[-recent_limit:]
+
+        return {
+            "message_count": len(ordered_messages),
+            "recent_message_count": len(recent_messages),
+            "recent_messages": [
+                {
+                    "message_id": msg.get("message_id", msg.get("id", "")),
+                    "sender_id": msg.get("sender_id", ""),
+                    "timestamp": msg.get("timestamp", 0),
+                    "message_length": len(str(msg.get("message", ""))),
+                    "message_preview": self._compact_refine_value(
+                        str(msg.get("message", "")).strip(),
+                        max_depth=0,
+                        max_str_len=240,
+                    ),
+                    "filter_reason": msg.get("filter_reason", ""),
+                }
+                for msg in recent_messages
+            ],
+        }
+
+    def _build_refine_analysis_payload(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+        style_analysis = analysis_data.get("style_analysis")
+        style_profile = analysis_data.get("style_profile")
+        learning_insights = analysis_data.get("learning_insights")
+
+        payload: Dict[str, Any] = {
+            "message_count": analysis_data.get("message_count", 0),
+            "style_analysis_success": bool(analysis_data.get("style_analysis_success", False)),
+            "degraded_mode": bool(analysis_data.get("degraded_mode", False)),
+        }
+
+        for key in ("degraded_reason", "filtering_reason", "filtering_detail", "analysis_timestamp"):
+            if analysis_data.get(key) is not None:
+                payload[key] = analysis_data.get(key)
+
+        if isinstance(style_analysis, dict):
+            payload["style_analysis"] = self._compact_refine_value(style_analysis, max_depth=2, max_items=6)
+        elif style_analysis is not None:
+            payload["style_analysis"] = self._compact_refine_value(style_analysis, max_depth=1, max_items=4)
+
+        if isinstance(style_profile, dict):
+            payload["style_profile"] = self._compact_refine_value(style_profile, max_depth=2, max_items=6)
+
+        if isinstance(learning_insights, dict):
+            payload["learning_insights"] = self._compact_refine_value(learning_insights, max_depth=1, max_items=6)
+
+        for key in ("style_attributes", "style_features", "enhanced_prompt", "refine_retry_meta"):
+            if analysis_data.get(key) is not None:
+                payload[key] = self._compact_refine_value(analysis_data.get(key), max_depth=1, max_items=6)
+
+        return payload
+
+    async def _run_refine_with_timeout_retry(
+        self,
+        llm_adapter,
+        *,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.6,
+        timeout_seconds: Optional[float] = None,
+        retry_count: Optional[int] = None,
+    ) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        timeout_seconds = float(timeout_seconds or self._get_refine_timeout_seconds())
+        max_retry = self._get_refine_retry_count() if retry_count is None else max(0, int(retry_count))
+        last_error: Optional[str] = None
+        attempts = 0
+        started_at = time.perf_counter()
+
+        for attempt in range(max_retry + 1):
+            attempts = attempt + 1
+            attempt_start = time.perf_counter()
+            try:
+                response = await asyncio.wait_for(
+                    llm_adapter.refine_chat_completion(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                    ),
+                    timeout=timeout_seconds,
+                )
+                if not response:
+                    raise ValueError("empty_refine_response")
+
+                clean_response = clean_llm_json_response(response)
+                parsed_response = safe_parse_llm_json(clean_response)
+                if not isinstance(parsed_response, dict) or not parsed_response:
+                    raise ValueError(f"invalid_refine_payload:{type(parsed_response)}")
+
+                duration = time.perf_counter() - attempt_start
+                total_duration = time.perf_counter() - started_at
+                logger.info(
+                    f"[LearningBatch] refine_call_success attempts={attempts} "
+                    f"attempt_duration={duration:.2f}s total_duration={total_duration:.2f}s "
+                    f"timeout_seconds={timeout_seconds}"
+                )
+                return parsed_response, {
+                    "success": True,
+                    "attempts": attempts,
+                    "timeout_seconds": timeout_seconds,
+                    "total_duration_seconds": total_duration,
+                    "last_error": None,
+                    "degraded_mode": False,
+                    "needs_refine_retry": False,
+                }
+            except asyncio.TimeoutError:
+                last_error = f"timeout_after_{timeout_seconds:.2f}s"
+                logger.warning(
+                    f"[LearningBatch] refine_call_timeout attempt={attempts} "
+                    f"timeout_seconds={timeout_seconds}"
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning(
+                    f"[LearningBatch] refine_call_failed attempt={attempts} error={exc}"
+                )
+
+            if attempts <= max_retry:
+                await asyncio.sleep(min(1.5, 0.5 * attempts))
+
+        total_duration = time.perf_counter() - started_at
+        logger.warning(
+            f"[LearningBatch] refine_call_failed_final attempts={attempts} "
+            f"timeout_seconds={timeout_seconds} total_duration={total_duration:.2f}s "
+            f"last_error={last_error}"
+        )
+        return None, {
+            "success": False,
+            "attempts": attempts,
+            "timeout_seconds": timeout_seconds,
+            "total_duration_seconds": total_duration,
+            "last_error": last_error,
+            "degraded_mode": True,
+            "needs_refine_retry": True,
+        }
+
     def _resolve_umo(self, group_id: str) -> str:
         """将group_id解析为unified_msg_origin以支持多配置文件"""
         if hasattr(self, 'group_id_to_unified_origin'):
@@ -182,9 +392,19 @@ class ProgressiveLearningService:
         """启动学习流程 - 优化为后台任务执行"""
         async with self.learning_lock: # 使用锁防止竞态条件
             try:
+                logger.info(
+                    f"[ProgressiveLearning] group={group_id} start_requested "
+                    f"active={self.learning_active.get(group_id, False)} "
+                    f"batch_size={self.batch_size} "
+                    f"interval_seconds={self.learning_interval} "
+                    f"quality_threshold={self.quality_threshold}"
+                )
                 # 检查该群组是否已经在学习
                 if self.learning_active.get(group_id, False):
-                    logger.info(f"群组 {group_id} 学习已在进行中，跳过启动")
+                    logger.info(
+                        f"[ProgressiveLearning] group={group_id} decision=skip "
+                        "reason=already_active"
+                    )
                     return True # 返回True表示学习状态正常
                 
                 # 设置该群组为学习状态
@@ -200,7 +420,10 @@ class ProgressiveLearningService:
                 # 保存新的学习会话到数据库
                 await self.db_manager.save_learning_session_record(group_id, self._group_sessions[group_id].__dict__)
                 
-                logger.info(f"开始学习会话: {session_id} for group {group_id}")
+                logger.info(
+                    f"[ProgressiveLearning] group={group_id} session_started "
+                    f"session_id={session_id}"
+                )
                 
                 # 创建后台任务，确保不阻塞主线程
                 learning_task = asyncio.create_task(self._learning_loop_safe(group_id))
@@ -316,16 +539,35 @@ class ProgressiveLearningService:
                                 reason=f"learning_paused:{reason}",
                             ),
                         )
-                        logger.warning(f"群组 {group_id} 学习被暂停: {reason}")
+                        logger.warning(
+                            f"[ProgressiveLearning] group={group_id} decision=pause "
+                            f"reason={reason}"
+                        )
                         await self.stop_learning(group_id)
                         break
                     
                     # 执行一个学习批次 - 在后台执行
+                    logger.info(
+                        f"[ProgressiveLearning] group={group_id} batch_start"
+                    )
                     batch_result = await self._execute_learning_batch_background(group_id)
                     if isinstance(batch_result, dict):
                         last_result = self._publish_learning_result(group_id, batch_result)
+                        logger.info(
+                            f"[ProgressiveLearning] group={group_id} batch_result "
+                            f"success={batch_result.get('success')} "
+                            f"generated_learning_content={batch_result.get('generated_learning_content')} "
+                            f"persona_applied={batch_result.get('persona_applied')} "
+                            f"session_updates_written={batch_result.get('session_updates_written')} "
+                            f"degraded_mode={batch_result.get('degraded_mode')} "
+                            f"reason={batch_result.get('reason')}"
+                        )
                     
                     # 等待下一个学习周期
+                    logger.debug(
+                        f"[ProgressiveLearning] group={group_id} sleeping "
+                        f"seconds={self.learning_interval}"
+                    )
                     await asyncio.sleep(self.learning_interval)
                     
                 except asyncio.CancelledError:
@@ -404,7 +646,14 @@ class ProgressiveLearningService:
             logger.info(f"开始处理 {len(unprocessed_messages)} 条消息（relearn_mode={relearn_mode}）")
             
             # 2. 使用多维度分析器筛选消息
+            filter_stage_start = time.perf_counter()
             filtered_messages = await self._filter_messages_with_context(unprocessed_messages)
+            filter_stage_duration = time.perf_counter() - filter_stage_start
+            logger.info(
+                f"[LearningBatch] group={group_id} stage=filter "
+                f"duration={filter_stage_duration:.2f}s "
+                f"input_count={len(unprocessed_messages)} output_count={len(filtered_messages)}"
+            )
             
             if not filtered_messages:
                 logger.debug("没有通过筛选的消息")
@@ -564,9 +813,16 @@ class ProgressiveLearningService:
                 limit=self.batch_size,
                 group_id=group_id,
             )
+            logger.info(
+                f"[ProgressiveLearning] group={group_id} batch_fetch "
+                f"unprocessed_messages={len(unprocessed_messages) if unprocessed_messages else 0}"
+            )
             
             if not unprocessed_messages:
-                logger.debug("没有未处理的消息，跳过此批次")
+                logger.info(
+                    f"[ProgressiveLearning] group={group_id} decision=skip "
+                    "reason=no_unprocessed_messages"
+                )
                 return self._create_batch_result(
                     success=False,
                     processed_messages=0,
@@ -574,7 +830,10 @@ class ProgressiveLearningService:
                     reason="no_unprocessed_messages_for_background_batch",
                 )
             
-            logger.info(f"开始后台处理 {len(unprocessed_messages)} 条消息")
+            logger.info(
+                f"[ProgressiveLearning] group={group_id} batch_processing_start "
+                f"message_count={len(unprocessed_messages)}"
+            )
             
             # 2. 并行执行筛选和获取人格
             filtered_messages, current_persona = await asyncio.gather(
@@ -593,7 +852,10 @@ class ProgressiveLearningService:
                 current_persona = {}
             
             if not filtered_messages:
-                logger.debug("没有通过筛选的消息")
+                logger.info(
+                    f"[ProgressiveLearning] group={group_id} decision=skip "
+                    "reason=no_messages_after_filtering"
+                )
                 await self._mark_messages_processed(unprocessed_messages)
                 return self._create_batch_result(
                     success=False,
@@ -890,6 +1152,8 @@ class ProgressiveLearningService:
             "processed_messages": batch_result.get("processed_messages", 0),
             "filtered_messages": batch_result.get("filtered_messages", 0),
             "degraded_mode": batch_result.get("degraded_mode", False),
+            "needs_refine_retry": analysis_data.get("needs_refine_retry", False),
+            "refine_attempts": analysis_data.get("refine_attempts", 0),
             "reason": batch_result.get("reason", ""),
             "style_features": analysis_data.get("style_features", []),
             "message_count": analysis_data.get("message_count", 0),
@@ -950,7 +1214,7 @@ class ProgressiveLearningService:
             error = style_analysis.error
             analysis_data = self._extract_analysis_data(style_analysis)
         elif isinstance(style_analysis, dict):
-            success = batch_result["success"]
+            success = bool(style_analysis.get("success", True))
             confidence = float(style_analysis.get("confidence", 0.6))
             timestamp = time.time()
             error = None
@@ -1029,16 +1293,38 @@ class ProgressiveLearningService:
         )
 
         base_persona = current_persona or {"prompt": "默认人格", "name": "default"}
-        updated_persona = await self._generate_updated_persona_with_refinement(
+        refine_stage_start = time.perf_counter()
+        updated_persona, refine_meta = await self._generate_updated_persona_with_refinement_v2(
             group_id,
             base_persona,
             style_analysis,
+            filtered_messages,
+        )
+        refine_stage_duration = time.perf_counter() - refine_stage_start
+        logger.info(
+            f"[LearningBatch] group={group_id} stage=refine "
+            f"duration={refine_stage_duration:.2f}s "
+            f"attempts={refine_meta.get('attempts', 0)} "
+            f"degraded_mode={refine_meta.get('degraded_mode', False)} "
+            f"needs_refine_retry={refine_meta.get('needs_refine_retry', False)}"
         )
         if not isinstance(updated_persona, dict):
             logger.warning(f"更新后人格结构异常，回退为当前人格副本: {type(updated_persona)}")
             updated_persona = dict(base_persona)
 
         analysis_data = self._extract_analysis_data(style_analysis)
+        if isinstance(refine_meta, dict) and refine_meta:
+            analysis_data["refine_retry_meta"] = refine_meta
+            analysis_data["refine_attempts"] = refine_meta.get("attempts", 0)
+            analysis_data["needs_refine_retry"] = bool(refine_meta.get("needs_refine_retry", False))
+            if refine_meta.get("degraded_mode"):
+                analysis_data["degraded_mode"] = True
+                refine_error = refine_meta.get("last_error") or "refine_failed"
+                existing_degraded_reason = analysis_data.get("degraded_reason")
+                if existing_degraded_reason:
+                    analysis_data["degraded_reason"] = f"{existing_degraded_reason}; refine_failed:{refine_error}"
+                else:
+                    analysis_data["degraded_reason"] = f"refine_failed:{refine_error}"
         filter_reasons = [
             msg.get("filter_reason")
             for msg in filtered_messages
@@ -1067,6 +1353,49 @@ class ProgressiveLearningService:
                 group_id,
                 filtered_messages,
                 analysis_data,
+            )
+
+        if self.config.enable_ml_analysis and self.ml_analyzer:
+            replay_persona = dict(base_persona)
+            replay_persona.setdefault("description", replay_persona.get("prompt", ""))
+            logger.info(
+                f"[LearningBatch] group={group_id} trigger=memory_replay "
+                f"message_count={len(filtered_messages)}"
+            )
+            try:
+                replay_stage_start = time.perf_counter()
+                replay_result = await self.ml_analyzer.reinforcement_memory_replay(
+                    group_id,
+                    filtered_messages,
+                    replay_persona,
+                    from_learning_batch=True,
+                )
+                replay_stage_duration = time.perf_counter() - replay_stage_start
+                logger.info(
+                    f"[LearningBatch] group={group_id} stage=replay "
+                    f"duration={replay_stage_duration:.2f}s "
+                    f"message_count={len(filtered_messages)}"
+                )
+                if replay_result:
+                    analysis_data["memory_replay_result"] = replay_result
+                    logger.info(
+                        f"[LearningBatch] group={group_id} memory_replay_result "
+                        f"keys={list(replay_result.keys())}"
+                    )
+                else:
+                    logger.info(
+                        f"[LearningBatch] group={group_id} memory_replay_result_empty"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"[LearningBatch] group={group_id} memory_replay_failed: {e}",
+                    exc_info=True,
+                )
+        else:
+            logger.info(
+                f"[LearningBatch] group={group_id} memory_replay_skipped "
+                f"enable_ml_analysis={self.config.enable_ml_analysis} "
+                f"ml_analyzer_available={bool(self.ml_analyzer)}"
             )
 
         style_analysis.data = analysis_data
@@ -1360,6 +1689,131 @@ class ProgressiveLearningService:
         except Exception as e:
             logger.error(f"使用提炼模型生成人格失败: {e}")
             return await self._generate_updated_persona(group_id, current_persona, style_analysis)
+
+    async def _generate_updated_persona_with_refinement_v2(
+        self,
+        group_id: str,
+        current_persona: Dict[str, Any],
+        style_analysis: Any,
+        filtered_messages: List[Dict[str, Any]],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """使用压缩输入的 refinement 版本，带超时和一次自动重试。"""
+        start_time = time.perf_counter()
+        refine_meta: Dict[str, Any] = {
+            "success": False,
+            "attempts": 0,
+            "timeout_seconds": self._get_refine_timeout_seconds(),
+            "total_duration_seconds": 0.0,
+            "last_error": None,
+            "degraded_mode": False,
+            "needs_refine_retry": False,
+        }
+
+        try:
+            if not hasattr(self.context, "persona_manager") or not self.context.persona_manager:
+                refine_meta["last_error"] = "persona_manager_unavailable"
+                refine_meta["degraded_mode"] = True
+                refine_meta["needs_refine_retry"] = True
+                return dict(current_persona), refine_meta
+
+            default_persona = await self.context.persona_manager.get_default_persona_v3(self._resolve_umo(group_id))
+            if not default_persona:
+                refine_meta["last_error"] = "default_persona_unavailable"
+                refine_meta["degraded_mode"] = True
+                refine_meta["needs_refine_retry"] = True
+                return dict(current_persona), refine_meta
+
+            if hasattr(self.multidimensional_analyzer, "llm_adapter") and self.multidimensional_analyzer.llm_adapter:
+                llm_adapter = self.multidimensional_analyzer.llm_adapter
+                if llm_adapter.has_refine_provider() and llm_adapter.providers_configured >= 2:
+                    from ...core.interfaces import AnalysisResult
+
+                    if isinstance(style_analysis, AnalysisResult):
+                        analysis_data = style_analysis.data if style_analysis.data else {}
+                    elif isinstance(style_analysis, dict):
+                        analysis_data = style_analysis
+                    elif hasattr(style_analysis, "data"):
+                        analysis_data = style_analysis.data if style_analysis.data else {}
+                    else:
+                        analysis_data = {}
+
+                    compact_current_persona = {
+                        "name": current_persona.get("name", default_persona.get("name", "default")),
+                        "prompt": self._compact_refine_value(current_persona.get("prompt", default_persona.get("prompt", "")), max_depth=0, max_str_len=2500),
+                        "description": self._compact_refine_value(current_persona.get("description", current_persona.get("prompt", "")), max_depth=0, max_str_len=500),
+                        "style_parameters": self._compact_refine_value(current_persona.get("style_parameters", {}), max_depth=1, max_items=6),
+                    }
+                    refine_payload = self._build_refine_analysis_payload(analysis_data)
+                    recent_messages_payload = self._build_recent_messages_refine_payload(filtered_messages)
+
+                    prompt = (
+                        self.prompts.PROGRESSIVE_LEARNING_GENERATE_UPDATED_PERSONA_PROMPT.format(
+                            current_persona_json=json.dumps(compact_current_persona, ensure_ascii=False, indent=2, default=self._json_serializer),
+                            style_analysis_json=json.dumps(refine_payload, ensure_ascii=False, indent=2, default=self._json_serializer),
+                        )
+                        + "\n\n【最近消息摘要】\n"
+                        + json.dumps(recent_messages_payload, ensure_ascii=False, indent=2, default=self._json_serializer)
+                        + "\n\n【精炼约束】请仅依据压缩后的分析和最近消息摘要进行更新；优先保留原有人格框架，避免扩写无关内容。"
+                    )
+                    logger.info(
+                        f"[LearningBatch] group={group_id} stage=refine_input "
+                        f"message_count={refine_payload.get('message_count', 0)} "
+                        f"recent_message_count={recent_messages_payload.get('recent_message_count', 0)} "
+                        f"prompt_chars={len(prompt)}"
+                    )
+
+                    refined_persona, call_meta = await self._run_refine_with_timeout_retry(
+                        llm_adapter,
+                        prompt=prompt,
+                        temperature=0.6,
+                    )
+                    refine_meta.update(call_meta)
+                    refine_meta["total_duration_seconds"] = time.perf_counter() - start_time
+
+                    if refined_persona:
+                        logger.info(
+                            f"[LearningBatch] group={group_id} filter provider bound "
+                            f"refine provider bound reinforce provider bound "
+                            f"stage=refine success=True attempts={refine_meta.get('attempts', 0)} "
+                            f"duration={refine_meta['total_duration_seconds']:.2f}s"
+                        )
+                        return refined_persona, refine_meta
+
+                    refine_meta["degraded_mode"] = True
+                    refine_meta["needs_refine_retry"] = True
+                    refine_meta["last_error"] = refine_meta.get("last_error") or "refine_failed_use_fallback"
+                    fallback_persona = await self._generate_updated_persona(group_id, current_persona, style_analysis)
+                    if not isinstance(fallback_persona, dict):
+                        fallback_persona = dict(current_persona)
+                    return fallback_persona, refine_meta
+
+                refine_meta["last_error"] = "refine_provider_unavailable"
+                refine_meta["degraded_mode"] = True
+                refine_meta["needs_refine_retry"] = True
+                fallback_persona = await self._generate_updated_persona(group_id, current_persona, style_analysis)
+                if not isinstance(fallback_persona, dict):
+                    fallback_persona = dict(current_persona)
+                refine_meta["total_duration_seconds"] = time.perf_counter() - start_time
+                return fallback_persona, refine_meta
+
+            refine_meta["last_error"] = "llm_adapter_unavailable"
+            refine_meta["degraded_mode"] = True
+            refine_meta["needs_refine_retry"] = True
+            fallback_persona = await self._generate_updated_persona(group_id, current_persona, style_analysis)
+            if not isinstance(fallback_persona, dict):
+                fallback_persona = dict(current_persona)
+            refine_meta["total_duration_seconds"] = time.perf_counter() - start_time
+            return fallback_persona, refine_meta
+        except Exception as exc:
+            logger.error(f"refine生成失败，回退到传统方法: {exc}", exc_info=True)
+            refine_meta["last_error"] = str(exc)
+            refine_meta["degraded_mode"] = True
+            refine_meta["needs_refine_retry"] = True
+            refine_meta["total_duration_seconds"] = time.perf_counter() - start_time
+            fallback_persona = await self._generate_updated_persona(group_id, current_persona, style_analysis)
+            if not isinstance(fallback_persona, dict):
+                fallback_persona = dict(current_persona)
+            return fallback_persona, refine_meta
 
     def _json_serializer(self, obj):
         """自定义JSON序列化器，处理不能直接序列化的对象"""

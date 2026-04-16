@@ -70,8 +70,16 @@ class LightweightMLAnalyzer:
         """
         强化学习记忆重放：通过强化模型分析历史数据和新数据的关联性，优化学习策略
         """
-        if not self.llm_adapter or not self.llm_adapter.has_reinforce_provider() and self.llm_adapter.providers_configured < 3:
-            logger.warning("强化模型未配置，跳过强化学习记忆重放功能")
+        providers_configured = getattr(self.llm_adapter, "providers_configured", 0) if self.llm_adapter else 0
+        logger.info(
+            f"[MLAnalyzer] MemoryReplay start group={group_id} "
+            f"message_count={len(new_messages)} providers_configured={providers_configured}"
+        )
+        if not self.llm_adapter or not self.llm_adapter.has_reinforce_provider() or providers_configured < 3:
+            logger.warning(
+                f"[MLAnalyzer] MemoryReplay skipped group={group_id} "
+                f"reason=reinforce_provider_unavailable providers_configured={providers_configured}"
+            )
             return {}
 
         try:
@@ -134,6 +142,10 @@ class LightweightMLAnalyzer:
                     })
 
                     logger.info(f"强化学习记忆重放完成，奖励分数: {reinforcement_result.get('reinforcement_feedback', {}).get('reward_score', 0)}")
+                    logger.info(
+                        f"[MLAnalyzer] ReplayMemory done group={group_id} "
+                        f"duration={time.perf_counter() - method_start:.2f}s"
+                    )
                     return reinforcement_result
 
                 except json.JSONDecodeError:
@@ -150,8 +162,17 @@ class LightweightMLAnalyzer:
         """
         强化学习增量微调：通过强化模型智能融合基础人格和增量更新
         """
-        if (not self.llm_adapter or not self.llm_adapter.has_reinforce_provider()) and self.llm_adapter.providers_configured < 3:
-            logger.warning("强化模型未配置，跳过增量微调功能")
+        providers_configured = getattr(self.llm_adapter, "providers_configured", 0) if self.llm_adapter else 0
+        logger.info(
+            f"[MLAnalyzer] IncrementalTuning start group={group_id} "
+            f"providers_configured={providers_configured}"
+        )
+        method_start = time.perf_counter()
+        if not self.llm_adapter or not self.llm_adapter.has_reinforce_provider() or providers_configured < 3:
+            logger.warning(
+                f"[MLAnalyzer] IncrementalTuning skipped group={group_id} "
+                f"reason=reinforce_provider_unavailable providers_configured={providers_configured}"
+            )
             return {}
 
         try:
@@ -219,6 +240,10 @@ class LightweightMLAnalyzer:
                     })
                     
                     logger.info(f"强化学习增量微调完成，预期改进: {tuning_result.get('performance_prediction', {}).get('expected_improvement', 0)}")
+                    logger.info(
+                        f"[MLAnalyzer] IncrementalTuning done group={group_id} "
+                        f"duration={time.perf_counter() - method_start:.2f}s"
+                    )
                     return tuning_result
                     
                 except json.JSONDecodeError:
@@ -234,8 +259,17 @@ class LightweightMLAnalyzer:
         """
         强化学习策略优化：基于历史表现数据动态调整学习策略
         """
-        if (not self.llm_adapter or not self.llm_adapter.has_reinforce_provider()) and self.llm_adapter.providers_configured < 3:
-            logger.warning("强化模型未配置，跳过策略优化功能")
+        providers_configured = getattr(self.llm_adapter, "providers_configured", 0) if self.llm_adapter else 0
+        logger.info(
+            f"[MLAnalyzer] StrategyOptimization start group={group_id} "
+            f"providers_configured={providers_configured}"
+        )
+        method_start = time.perf_counter()
+        if not self.llm_adapter or not self.llm_adapter.has_reinforce_provider() or providers_configured < 3:
+            logger.warning(
+                f"[MLAnalyzer] StrategyOptimization skipped group={group_id} "
+                f"reason=reinforce_provider_unavailable providers_configured={providers_configured}"
+            )
             return {}
 
         try:
@@ -276,6 +310,10 @@ class LightweightMLAnalyzer:
                     })
                     
                     logger.info(f"强化学习策略优化完成，预期学习速度提升: {optimization_result.get('expected_improvements', {}).get('learning_speed', 0)}")
+                    logger.info(
+                        f"[MLAnalyzer] StrategyOptimization done group={group_id} "
+                        f"duration={time.perf_counter() - method_start:.2f}s"
+                    )
                     return optimization_result
                     
                 except json.JSONDecodeError:
@@ -332,13 +370,22 @@ class LightweightMLAnalyzer:
             logger.error(f"保守融合失败: {e}")
             return original_prompt
 
-    async def replay_memory(self, group_id: str, new_messages: List[Dict[str, Any]], current_persona: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def replay_memory(self, group_id: str, new_messages: List[Dict[str, Any]], current_persona: Dict[str, Any], from_learning_batch: bool = False) -> List[Dict[str, Any]]:
         """
         记忆重放：将历史数据与新数据混合，并交给提炼模型进行处理。
         这模拟了LLM的"增量微调"过程，通过重新暴露历史数据来巩固学习。
         """
-        if (not self.llm_adapter or not self.llm_adapter.has_refine_provider()) and self.llm_adapter.providers_configured < 2:
-            logger.warning("提炼模型未配置，跳过记忆重放功能")
+        providers_configured = getattr(self.llm_adapter, "providers_configured", 0) if self.llm_adapter else 0
+        logger.info(
+            f"[MLAnalyzer] ReplayMemory start group={group_id} "
+            f"message_count={len(new_messages)} providers_configured={providers_configured}"
+        )
+        method_start = time.perf_counter()
+        if not self.llm_adapter or not self.llm_adapter.has_refine_provider() or providers_configured < 2:
+            logger.warning(
+                f"[MLAnalyzer] ReplayMemory skipped group={group_id} "
+                f"reason=refine_provider_unavailable providers_configured={providers_configured}"
+            )
             return []
 
         try:
@@ -371,7 +418,7 @@ class LightweightMLAnalyzer:
             prompt = f"""{self.prompts.JSON_ONLY_SYSTEM_PROMPT}
 
 {self.prompts.ML_ANALYZER_REPLAY_MEMORY_SYSTEM_PROMPT.format(
-                current_persona_description=current_persona['description']
+                current_persona_description=current_persona.get('description', '')
             )}
 
 {self.prompts.ML_ANALYZER_REPLAY_MEMORY_PROMPT.format(

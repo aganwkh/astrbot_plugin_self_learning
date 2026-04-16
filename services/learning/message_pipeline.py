@@ -97,6 +97,14 @@ class MessagePipeline:
             # 3. 黑话挖掘 — 每收集 10 条消息触发一次
             stats = await self._message_collector.get_statistics(group_id)
             raw_message_count = stats.get("raw_messages", 0)
+            unprocessed_message_count = stats.get("unprocessed_messages", 0)
+            logger.info(
+                f"[LearningPipeline] group={group_id} learning_candidate "
+                f"raw_messages={raw_message_count} "
+                f"unprocessed_messages={unprocessed_message_count} "
+                f"auto_learning={self._config.enable_auto_learning} "
+                f"ml_analysis={self._config.enable_ml_analysis}"
+            )
             if raw_message_count % 10 == 0 and raw_message_count >= 10:
                 self._spawn(self.mine_jargon(group_id))
 
@@ -124,7 +132,14 @@ class MessagePipeline:
                 )
 
             # 5. 智能启动学习任务
+            logger.info(
+                f"[LearningPipeline] group={group_id} dispatch_learning_task "
+                "target=group_orchestrator.smart_start_learning_for_group"
+            )
             await self._group_orchestrator.smart_start_learning_for_group(group_id)
+            logger.info(
+                f"[LearningPipeline] group={group_id} dispatch_learning_task_completed"
+            )
 
             # 6. 对话目标管理
             if self._config.enable_goal_driven_chat:
