@@ -548,26 +548,35 @@ class PluginLifecycle:
     # 辅助异步方法
 
     async def _delayed_provider_reinitialization(self) -> None:
-        """延迟重新初始化提供商配置，解决重启后配置丢失问题"""
+        """Wait for the provider registry to become ready and then rebind providers."""
         p = self._plugin
         try:
-            await asyncio.sleep(10)
+            adapter = getattr(p, "llm_adapter", None)
+            if not adapter:
+                return
 
-            if getattr(p, "llm_adapter", None):
-                p.llm_adapter.initialize_providers(p.plugin_config)
-                logger.info("延迟重新初始化提供商配置完成")
-
-                if p.llm_adapter.providers_configured == 0:
-                    logger.warning("重新初始化后仍然没有配置任何提供商，请检查配置")
-                    await asyncio.sleep(30)
-                    p.llm_adapter.initialize_providers(p.plugin_config)
-                    logger.info("第二次尝试重新初始化提供商配置")
-                else:
-                    logger.info(
-                        f"成功配置了 {p.llm_adapter.providers_configured} 个提供商"
-                    )
+            logger.info(
+                "[LLM adapter] background provider rebinding started; "
+                "polling until the provider registry is ready"
+            )
+            bound = await adapter.wait_for_provider_binding(
+                p.plugin_config,
+                timeout=120.0,
+                initial_delay=1.0,
+                poll_interval=1.0,
+                max_poll_interval=10.0,
+            )
+            if bound:
+                logger.info(
+                    "[LLM adapter] background provider rebinding completed successfully"
+                )
+            else:
+                logger.warning(
+                    "[LLM adapter] background provider rebinding finished with pending "
+                    "providers; later calls will keep retrying"
+                )
         except Exception as e:
-            logger.error(f"延迟重新初始化提供商配置失败: {e}")
+            logger.error(f"[LLM adapter] delayed provider rebinding failed: {e}")
 
     async def _delayed_start_learning(self, group_id: str) -> None:
         """延迟启动学习服务"""

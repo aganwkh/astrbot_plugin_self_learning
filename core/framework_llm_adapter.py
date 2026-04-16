@@ -32,207 +32,291 @@ class FrameworkLLMAdapter:
             'general': {'total_calls': 0, 'total_time': 0, 'errors': 0}
         }
         
-    def initialize_providers(self, config):
-        """根据配置初始化Provider"""
+    def _collect_available_chat_completion_providers(self, emit_logs: bool = True) -> List[Provider]:
+        """Collect CHAT_COMPLETION providers currently visible in the registry."""
         from astrbot.core.provider.entities import ProviderType
 
-        # 保存配置用于可能的延迟初始化
-        self._config = config
-        self.providers_configured = 0
-        self.filter_provider = None
-        self.refine_provider = None
-        self.reinforce_provider = None
+        available_providers = []
+        try:
+            all_providers = self.context.get_all_providers()
+            if emit_logs:
+                logger.info(f" - discovered {len(all_providers)} providers")
 
-        # 添加配置调试日志
-        logger.info(f" [LLM适配器] 开始初始化Provider，配置信息：")
+            for provider in all_providers:
+                try:
+                    provider_meta = provider.meta()
+                except Exception as meta_error:
+                    if emit_logs:
+                        logger.debug(f"skip provider with unreadable meta: {meta_error}")
+                    continue
+
+                if provider_meta.provider_type == ProviderType.CHAT_COMPLETION:
+                    available_providers.append(provider)
+                    if emit_logs:
+                        logger.debug(
+                            f" provider {provider_meta.id} available (type: {provider_meta.provider_type.value})"
+                        )
+
+            if emit_logs:
+                logger.info(
+                    f" discovered {len(available_providers)} CHAT_COMPLETION providers"
+                )
+        except Exception as e:
+            logger.warning(f"failed to collect available providers: {e}")
+
+        return available_providers
+
+    def _select_provider_for_role(
+        self,
+        role_name: str,
+        configured_provider_id: Optional[str],
+        current_provider: Optional[Provider],
+        available_providers: List[Provider],
+        available_provider_map: Dict[str, Provider],
+        used_provider_ids,
+    ):
+        """Resolve a single role, keeping existing bindings if the target is not yet visible."""
+
+        current_provider_id = None
+        if current_provider:
+            try:
+                current_provider_id = current_provider.meta().id
+            except Exception:
+                current_provider_id = None
+
+        if configured_provider_id:
+            if current_provider_id == configured_provider_id:
+                if current_provider_id:
+                    used_provider_ids.add(current_provider_id)
+                return current_provider, True
+
+            provider = available_provider_map.get(configured_provider_id)
+            if provider is not None:
+                provider_id = provider.meta().id
+                used_provider_ids.add(provider_id)
+                logger.info(f"{role_name} provider bound: {provider_id}")
+                return provider, True
+
+            if current_provider is not None:
+                if current_provider_id:
+                    used_provider_ids.add(current_provider_id)
+                logger.warning(
+                    f"{role_name} provider pending: {configured_provider_id} "
+                    f"(current bound: {current_provider_id})"
+                )
+                return current_provider, False
+
+            logger.warning(f"{role_name} provider pending: {configured_provider_id}")
+            return None, False
+
+        if current_provider is not None:
+            if current_provider_id:
+                used_provider_ids.add(current_provider_id)
+            return current_provider, True
+
+        for provider in available_providers:
+            try:
+                provider_id = provider.meta().id
+            except Exception:
+                continue
+            if provider_id in used_provider_ids:
+                continue
+            used_provider_ids.add(provider_id)
+            logger.info(f"{role_name} provider bound: {provider_id}")
+            return provider, True
+
+        if available_providers:
+            provider = available_providers[0]
+            provider_id = provider.meta().id
+            used_provider_ids.add(provider_id)
+            logger.info(f"{role_name} provider bound: {provider_id}")
+            return provider, True
+
+        return None, False
+
+    def initialize_providers(self, config):
+        """Initialize provider bindings from the AstrBot registry."""
+        self._config = config
+
+        logger.info("[LLM adapter] initialize provider bindings")
         logger.info(f" - filter_provider_id: {config.filter_provider_id}")
         logger.info(f" - refine_provider_id: {config.refine_provider_id}")
         logger.info(f" - reinforce_provider_id: {config.reinforce_provider_id}")
 
-        # 获取所有可用的Provider列表作为备选
-        available_providers = []
-        try:
-            # 使用 get_all_providers() 方法获取所有 CHAT_COMPLETION 类型的 Provider
-            all_providers = self.context.get_all_providers()
-            logger.info(f" - 发现 {len(all_providers)} 个 Provider")
-
-            for provider in all_providers:
-                provider_meta = provider.meta()
-                if provider_meta.provider_type == ProviderType.CHAT_COMPLETION:
-                    available_providers.append(provider)
-                    logger.debug(f" Provider {provider_meta.id} 可用 (类型: {provider_meta.provider_type.value})")
-
-            logger.info(f" 发现 {len(available_providers)} 个可用的 CHAT_COMPLETION 类型 Provider")
-        except Exception as e:
-            logger.warning(f"获取可用Provider列表失败: {e}")
-
         has_configured_provider_ids = bool(
             config.filter_provider_id or config.refine_provider_id or config.reinforce_provider_id
         )
+
+        available_providers = self._collect_available_chat_completion_providers(
+            emit_logs=True
+        )
         provider_registry_ready = len(available_providers) > 0
 
-        # 启动早期常见场景：Provider 注册表尚未准备完成。
-        # 此时直接返回，避免误报“配置错误”日志。
         if not provider_registry_ready:
             self._needs_lazy_init = True
+            self.providers_configured = sum(
+                1
+                for provider in (self.filter_provider, self.refine_provider, self.reinforce_provider)
+                if provider is not None
+            )
             if has_configured_provider_ids:
                 logger.warning(
-                    " [LLM适配器] Provider 注册表尚未就绪（当前 0 个），"
-                    "跳过本次绑定并等待延迟重试。"
+                    "[LLM adapter] provider registry is not ready (0 visible providers); "
+                    "keep pending and retry later"
                 )
             else:
                 logger.warning(
-                    " [LLM适配器] 当前没有可用 Provider，且未配置 provider_id，"
-                    "稍后将重试初始化。"
+                    "[LLM adapter] no provider is currently available and no provider_id "
+                    "is configured; keep pending and retry later"
                 )
-            return
-        
-        # 初始化筛选Provider
-        if config.filter_provider_id:
-            self.filter_provider = self.context.get_provider_by_id(config.filter_provider_id)
-            if not self.filter_provider:
-                logger.warning(f"找不到筛选Provider: {config.filter_provider_id}")
-                # 如果指定的Provider不存在，尝试使用第一个可用的Provider
-                if available_providers:
-                    self.filter_provider = available_providers[0]
-                    logger.info(f"自动分配筛选Provider: {self.filter_provider.meta().id}")
-            else:
-                # 检查Provider类型
-                provider_meta = self.filter_provider.meta()
-                if provider_meta.provider_type != ProviderType.CHAT_COMPLETION:
-                    logger.error(f"筛选Provider类型错误: {config.filter_provider_id} 是 {provider_meta.provider_type.value} 类型，需要 {ProviderType.CHAT_COMPLETION.value} 类型")
-                    self.filter_provider = None
-                    # 尝试使用备选Provider
-                    if available_providers:
-                        self.filter_provider = available_providers[0]
-                        logger.info(f"自动分配筛选Provider: {self.filter_provider.meta().id}")
-                else:
-                    logger.info(f"筛选Provider已配置: {config.filter_provider_id}")
-                    
-        if self.filter_provider:
-            self.providers_configured += 1
-                
-        # 初始化提炼Provider
-        if config.refine_provider_id:
-            self.refine_provider = self.context.get_provider_by_id(config.refine_provider_id)
-            if not self.refine_provider:
-                logger.warning(f"找不到提炼Provider: {config.refine_provider_id}")
-                # 如果指定的Provider不存在，尝试使用可用的Provider（避免与filter重复）
-                for provider in available_providers:
-                    if provider != self.filter_provider:
-                        self.refine_provider = provider
-                        logger.info(f"自动分配提炼Provider: {self.refine_provider.meta().id}")
-                        break
-                if not self.refine_provider and available_providers:
-                    # 如果没有其他Provider，也可以复用filter_provider
-                    self.refine_provider = available_providers[0]
-                    logger.info(f"复用筛选Provider作为提炼Provider: {self.refine_provider.meta().id}")
-            else:
-                # 检查Provider类型
-                provider_meta = self.refine_provider.meta()
-                if provider_meta.provider_type != ProviderType.CHAT_COMPLETION:
-                    logger.error(f"提炼Provider类型错误: {config.refine_provider_id} 是 {provider_meta.provider_type.value} 类型，需要 {ProviderType.CHAT_COMPLETION.value} 类型")
-                    self.refine_provider = None
-                    # 尝试使用备选Provider
-                    for provider in available_providers:
-                        if provider != self.filter_provider:
-                            self.refine_provider = provider
-                            logger.info(f"自动分配提炼Provider: {self.refine_provider.meta().id}")
-                            break
-                else:
-                    logger.info(f"提炼Provider已配置: {config.refine_provider_id}")
-                    
-        if self.refine_provider:
-            self.providers_configured += 1
-                
-        # 初始化强化Provider
-        if config.reinforce_provider_id:
-            self.reinforce_provider = self.context.get_provider_by_id(config.reinforce_provider_id)
-            if not self.reinforce_provider:
-                logger.warning(f"找不到强化Provider: {config.reinforce_provider_id}")
-                # 如果指定的Provider不存在，尝试使用可用的Provider（避免与已有重复）
-                for provider in available_providers:
-                    if provider != self.filter_provider and provider != self.refine_provider:
-                        self.reinforce_provider = provider
-                        logger.info(f"自动分配强化Provider: {self.reinforce_provider.meta().id}")
-                        break
-                if not self.reinforce_provider and available_providers:
-                    # 如果没有其他Provider，也可以复用已有Provider
-                    self.reinforce_provider = available_providers[0]
-                    logger.info(f"复用Provider作为强化Provider: {self.reinforce_provider.meta().id}")
-            else:
-                # 检查Provider类型
-                provider_meta = self.reinforce_provider.meta()
-                if provider_meta.provider_type != ProviderType.CHAT_COMPLETION:
-                    logger.error(f"强化Provider类型错误: {config.reinforce_provider_id} 是 {provider_meta.provider_type.value} 类型，需要 {ProviderType.CHAT_COMPLETION.value} 类型")
-                    self.reinforce_provider = None
-                    # 尝试使用备选Provider
-                    for provider in available_providers:
-                        if provider != self.filter_provider and provider != self.refine_provider:
-                            self.reinforce_provider = provider
-                            logger.info(f"自动分配强化Provider: {self.reinforce_provider.meta().id}")
-                            break
-                else:
-                    logger.info(f"强化Provider已配置: {config.reinforce_provider_id}")
-                    
-        if self.reinforce_provider:
-            self.providers_configured += 1
-        
-        # 如果配置文件中没有指定任何Provider，尝试自动配置第一个可用的Provider到所有角色
-        if self.providers_configured == 0 and available_providers:
-            logger.warning("配置文件中未指定任何Provider，尝试自动配置...")
-            first_provider = available_providers[0]
-            self.filter_provider = first_provider
-            self.refine_provider = first_provider
-            self.reinforce_provider = first_provider
-            self.providers_configured = 3
-            logger.info(f"已自动配置Provider到所有角色: {first_provider.meta().id}")
-        
-        # 友好的配置状态提示
-        if self.providers_configured == 0:
-            logger.error(" 没有可用的AI模型Provider。请在AstrBot中配置至少一个CHAT_COMPLETION类型的Provider，并在插件配置中指定Provider ID。")
-        elif self.providers_configured < 3:
-            logger.info(f" 已配置 {self.providers_configured}/3 个AI模型Provider。部分高级功能可能使用简化算法。")
-        else:
-            logger.info(f" 已成功配置所有 {self.providers_configured} 个AI模型Provider！")
+            return False
 
-        if self.providers_configured > 0:
-            self._needs_lazy_init = False
-            
-        # 显示最终配置结果
+        available_provider_map = {}
+        for provider in available_providers:
+            try:
+                available_provider_map[provider.meta().id] = provider
+            except Exception:
+                continue
+
+        used_provider_ids = set()
+        new_filter_provider, filter_resolved = self._select_provider_for_role(
+            "filter",
+            config.filter_provider_id,
+            self.filter_provider,
+            available_providers,
+            available_provider_map,
+            used_provider_ids,
+        )
+        new_refine_provider, refine_resolved = self._select_provider_for_role(
+            "refine",
+            config.refine_provider_id,
+            self.refine_provider,
+            available_providers,
+            available_provider_map,
+            used_provider_ids,
+        )
+        new_reinforce_provider, reinforce_resolved = self._select_provider_for_role(
+            "reinforce",
+            config.reinforce_provider_id,
+            self.reinforce_provider,
+            available_providers,
+            available_provider_map,
+            used_provider_ids,
+        )
+
+        self.filter_provider = new_filter_provider
+        self.refine_provider = new_refine_provider
+        self.reinforce_provider = new_reinforce_provider
+        self.providers_configured = sum(
+            1
+            for provider in (self.filter_provider, self.refine_provider, self.reinforce_provider)
+            if provider is not None
+        )
+
+        all_roles_ready = filter_resolved and refine_resolved and reinforce_resolved
+        if has_configured_provider_ids and not all_roles_ready:
+            self._needs_lazy_init = True
+            logger.warning(
+                "[LLM adapter] configured provider ids are still not fully visible; "
+                "keep pending and retry binding"
+            )
+        else:
+            self._needs_lazy_init = False if self.providers_configured > 0 else True
+
+        if self.filter_provider:
+            logger.info(f"filter provider bound: {self.filter_provider.meta().id}")
+        if self.refine_provider:
+            logger.info(f"refine provider bound: {self.refine_provider.meta().id}")
+        if self.reinforce_provider:
+            logger.info(f"reinforce provider bound: {self.reinforce_provider.meta().id}")
+
+        if self.providers_configured == 0:
+            logger.error(
+                "No usable AI provider is currently bound. "
+                "Please wait until AstrBot finishes loading the provider registry."
+            )
+        elif self.providers_configured < 3:
+            logger.info(
+                f"Bound {self.providers_configured}/3 AI providers; some advanced "
+                "paths may stay in fallback mode until the rest become visible."
+            )
+        else:
+            logger.info("All 3 AI providers are bound successfully.")
+
         config_summary = []
         if self.filter_provider:
-            config_summary.append(f"筛选: {self.filter_provider.meta().id}")
+            config_summary.append(f"filter: {self.filter_provider.meta().id}")
         if self.refine_provider:
-            config_summary.append(f"提炼: {self.refine_provider.meta().id}")
+            config_summary.append(f"refine: {self.refine_provider.meta().id}")
         if self.reinforce_provider:
-            config_summary.append(f"强化: {self.reinforce_provider.meta().id}")
-        
+            config_summary.append(f"reinforce: {self.reinforce_provider.meta().id}")
+
         if config_summary:
-            logger.info(f" Provider配置摘要: {' | '.join(config_summary)}")
+            logger.info(f" Provider binding summary: {' | '.join(config_summary)}")
         else:
-            logger.warning(" 所有Provider均未配置，插件功能将受限")
+            logger.warning(" All providers are still unbound; plugin features will be limited")
+
+        return all_roles_ready
 
     def _try_lazy_init(self):
-        """尝试延迟初始化Provider（带30秒冷却间隔，避免高频重试开销）"""
+        """Attempt to lazily bind providers again when the registry becomes ready."""
         if not self._needs_lazy_init or not self._config:
             return
+
         now = time.time()
-        if now - self._last_lazy_init_attempt < self._lazy_init_cooldown:
-            return
+        registry_has_visible_providers = bool(
+            self._collect_available_chat_completion_providers(emit_logs=False)
+        )
+
+        if not registry_has_visible_providers:
+            if now - self._last_lazy_init_attempt < self._lazy_init_cooldown:
+                return
+
         self._last_lazy_init_attempt = now
-        logger.info("[LLM适配器] 尝试延迟初始化Provider...")
+        logger.info("[LLM adapter] trying lazy provider rebinding...")
         try:
-            self.initialize_providers(self._config)
-            if self.providers_configured > 0:
+            if self.initialize_providers(self._config):
                 self._needs_lazy_init = False
-                logger.info(f"[LLM适配器] 延迟初始化成功，已配置 {self.providers_configured} 个Provider")
+                logger.info(
+                    f"[LLM adapter] lazy provider rebinding succeeded; "
+                    f"{self.providers_configured} providers are bound"
+                )
+            elif self.providers_configured > 0:
+                logger.warning(
+                    "[LLM adapter] lazy rebinding finished with partial bindings; "
+                    "keep retrying until all configured provider ids are visible"
+                )
             else:
-                logger.warning("[LLM适配器] 延迟初始化仍未找到可用Provider")
+                logger.warning(
+                    "[LLM adapter] lazy rebinding still found no bindable provider"
+                )
         except Exception as e:
-            logger.warning(f"[LLM适配器] 延迟初始化失败: {e}")
+            logger.warning(f"[LLM adapter] lazy provider rebinding failed: {e}")
+
+    async def wait_for_provider_binding(self, config, timeout: float = 120.0, initial_delay: float = 1.0, poll_interval: float = 1.0, max_poll_interval: float = 10.0) -> bool:
+        """Poll until the requested providers become visible and binding succeeds."""
+        self._config = config
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
+
+        start_time = time.time()
+        interval = poll_interval
+        while True:
+            if self.initialize_providers(config):
+                return True
+
+            if time.time() - start_time >= timeout:
+                logger.warning(
+                    "[LLM adapter] provider-ready polling timed out; "
+                    "keep current bindings and rely on later retries"
+                )
+                return False
+
+            await asyncio.sleep(interval)
+            interval = min(interval * 2, max_poll_interval)
 
     async def filter_chat_completion(
+
         self,
         prompt: str,
         contexts: Optional[List[Dict[str, str]]] = None,
