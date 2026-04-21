@@ -59,7 +59,7 @@ class PluginConfig(BaseModel):
 
     # 学习参数
     learning_interval_hours: int = 6 # 学习间隔（小时）
-    min_messages_for_learning: int = 50 # 最少消息数量才开始学习
+    min_messages_for_learning: int = 25 # 最少消息数量才开始学习
     max_messages_per_batch: int = 200 # 每批处理的最大消息数量
 
     # 筛选参数

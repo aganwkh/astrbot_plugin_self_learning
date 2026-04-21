@@ -98,7 +98,8 @@ class GroupLearningOrchestrator:
                     "min_messages_for_learning",
                     default=10,
                 )
-                warmup_min_messages = max(5, min(10, min_messages))
+                effective_min_messages = max(20, min(min_messages, 30))
+                warmup_min_messages = max(10, min(effective_min_messages, 20))
 
                 logger.info(
                     f"[LearningGate] group={group_id} candidate "
@@ -106,6 +107,7 @@ class GroupLearningOrchestrator:
                     f"raw_messages={stats.get('raw_messages', 0)} "
                     f"unprocessed_messages={unprocessed_count} "
                     f"warmup_min_messages={warmup_min_messages} "
+                    f"effective_min_messages={effective_min_messages} "
                     f"min_messages={min_messages} "
                     f"last_start={last_start:.0f}"
                 )
@@ -202,19 +204,21 @@ class GroupLearningOrchestrator:
                 "min_messages_for_learning",
                 default=10,
             )
+            effective_min_messages = max(20, min(min_messages, 30))
 
             logger.info(
                 f"[LearningGate] group={group_id} candidate "
                 f"raw_messages={stats.get('raw_messages', 0)} "
                 f"unprocessed_messages={unprocessed_count} "
+                f"effective_min_messages={effective_min_messages} "
                 f"min_messages={min_messages} "
                 f"last_start={last_start:.0f}"
             )
 
-            if unprocessed_count < min_messages:
+            if unprocessed_count < effective_min_messages:
                 logger.info(
                     f"[LearningGate] group={group_id} decision=skip reason=below_threshold "
-                    f"unprocessed_messages={unprocessed_count} min_messages={min_messages}"
+                    f"unprocessed_messages={unprocessed_count} min_messages={effective_min_messages}"
                 )
                 return
 
@@ -222,7 +226,7 @@ class GroupLearningOrchestrator:
 
             logger.info(
                 f"[LearningGate] group={group_id} decision=start "
-                f"unprocessed_messages={unprocessed_count} min_messages={min_messages}"
+                f"unprocessed_messages={unprocessed_count} min_messages={effective_min_messages}"
             )
             learning_task = asyncio.create_task(
                 self._start_group_learning(group_id)

@@ -1025,12 +1025,22 @@ function initializeStyleLearningDashboard() {
       });
       const confidenceData = styleProgress.map((item) => {
         // quality_score 通常是 0-1 之间的值，转换为百分比
-        return (item.quality_score || 0) * 100;
+        if (item.quality_percent != null) {
+          return Number(item.quality_percent);
+        }
+        if (item.quality_score == null) {
+          return null;
+        }
+        const numericScore = Number(item.quality_score);
+        if (!Number.isFinite(numericScore)) {
+          return null;
+        }
+        return numericScore > 1 ? numericScore : numericScore * 100;
       });
       const sampleData = styleProgress.map((item) => {
         // 使用 filtered_count 或 message_count 作为样本数量
         return (
-          item.filtered_count || item.message_count || item.total_samples || 0
+          item.filtered_count ?? item.message_count ?? item.total_samples ?? 0
         );
       });
 
@@ -2981,10 +2991,12 @@ function renderStyleLearningStats(stats) {
   document.getElementById("style-types-count").textContent =
     stats.unique_styles || 0;
   document.getElementById("avg-confidence").textContent =
-    (stats.avg_confidence || 0) + "%";
-  document.getElementById("total-samples").textContent = formatNumber(
-    stats.total_samples || 0,
-  );
+    stats.avg_confidence == null ? "暂无数据" : stats.avg_confidence + "%";
+  document.getElementById("total-samples").textContent =
+    stats.raw_message_count_source === "unavailable" &&
+    Number(stats.total_samples ?? 0) === 0
+      ? "暂无可靠数据"
+      : formatNumber(stats.total_samples ?? 0);
 
   // 格式化最新更新时间
   if (stats.latest_update && !isNaN(stats.latest_update)) {
@@ -3016,6 +3028,130 @@ function initializeStyleLearningCharts(results, patterns) {
 }
 
 // 风格学习进度图表
+function getStylePatternLabel(pattern) {
+  if (typeof pattern === "string") {
+    const text = pattern.trim();
+    if (!text) return "";
+    if (
+      (text.startsWith("{") && text.endsWith("}")) ||
+      (text.startsWith("[") && text.endsWith("]"))
+    ) {
+      try {
+        return getStylePatternLabel(JSON.parse(text));
+      } catch (error) {
+        return "";
+      }
+    }
+    return text;
+  }
+  if (!pattern || typeof pattern !== "object") {
+    return "";
+  }
+  for (const key of [
+    "display_name",
+    "name",
+    "pattern",
+    "style",
+    "topic",
+    "label",
+    "text",
+  ]) {
+    if (typeof pattern[key] === "string" && pattern[key].trim()) {
+      return pattern[key].trim();
+    }
+  }
+  return "";
+}
+
+function getStylePatternNumericValue(pattern) {
+  if (!pattern || typeof pattern !== "object") {
+    return null;
+  }
+  let source = pattern.value_source || null;
+  let rawValue = null;
+  if (pattern.numeric_value != null) {
+    rawValue = pattern.numeric_value;
+  } else if (pattern.value != null) {
+    rawValue = pattern.value;
+    source = source || "value";
+  } else if (pattern.count != null) {
+    rawValue = pattern.count;
+    source = source || "count";
+  } else if (pattern.usage_count != null) {
+    rawValue = pattern.usage_count;
+    source = source || "usage_count";
+  } else if (pattern.frequency != null) {
+    rawValue = pattern.frequency;
+    source = source || "frequency";
+  } else if (pattern.interest_level != null) {
+    rawValue = pattern.interest_level;
+    source = source || "interest_level";
+  } else if (pattern.score != null) {
+    rawValue = pattern.score;
+    source = source || "score";
+  } else if (pattern.confidence != null) {
+    rawValue = pattern.confidence;
+    source = source || "confidence";
+  } else if (pattern.weight != null) {
+    rawValue = pattern.weight;
+    source = source || "weight";
+  }
+  if (rawValue == null) {
+    return null;
+  }
+  let numeric = Number(rawValue);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  if (["score", "confidence", "weight"].includes(source) && numeric > 0 && numeric <= 1) {
+    numeric *= 100;
+  }
+  return Math.round(numeric * 10) / 10;
+}
+
+function getStyleProgressQualityPercent(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  if (item.quality_percent != null) {
+    const numericPercent = Number(item.quality_percent);
+    if (Number.isFinite(numericPercent)) {
+      return numericPercent > 0 && numericPercent <= 1
+        ? numericPercent * 100
+        : numericPercent;
+    }
+  }
+  if (item.quality_score == null && item.score == null) {
+    return null;
+  }
+  const rawValue = item.quality_score != null ? item.quality_score : item.score;
+  const numericScore = Number(rawValue);
+  if (!Number.isFinite(numericScore)) {
+    return null;
+  }
+  return numericScore > 1 ? numericScore : numericScore * 100;
+}
+
+function getStyleProgressSampleCount(item) {
+  if (!item || typeof item !== "object") {
+    return 0;
+  }
+  for (const key of [
+    "sample_count",
+    "filtered_count",
+    "message_count",
+    "processed_messages",
+    "total_samples",
+  ]) {
+    if (item[key] == null) continue;
+    const numericValue = Number(item[key]);
+    if (Number.isFinite(numericValue)) {
+      return Math.max(0, Math.round(numericValue));
+    }
+  }
+  return 0;
+}
+
 function initializeStyleProgressChart(progressData) {
   const chartDom = document.getElementById("style-progress-chart");
   const chart = echarts.init(chartDom, "material");
@@ -3053,23 +3189,56 @@ function initializeStyleProgressChart(progressData) {
   }
 
   const styles = progressData.map((item) => {
-    // 使用 group_id 或者时间戳作为标签
+    if (item.label) {
+      return String(item.label);
+    }
+    if (item.batch_name) {
+      return String(item.batch_name);
+    }
     if (item.group_id) {
       return `群组${item.group_id}`;
-    } else if (item.timestamp) {
-      const date = new Date(item.timestamp * 1000);
+    }
+    if (item.timestamp) {
+      const timestamp = Number(item.timestamp);
+      const date = new Date(timestamp > 1e12 ? timestamp : timestamp * 1000);
       return date.toLocaleDateString();
     }
     return "未知";
   });
-  const confidenceData = progressData.map((item) => {
-    // quality_score 通常是 0-1 之间的值，转换为百分比
-    return (item.quality_score || 0) * 100;
-  });
-  const sampleData = progressData.map((item) => {
-    // 使用 filtered_count 或 message_count 作为样本数量
-    return item.filtered_count || item.message_count || item.total_samples || 0;
-  });
+  const confidenceData = progressData.map((item) =>
+    getStyleProgressQualityPercent(item),
+  );
+  const sampleData = progressData.map((item) => getStyleProgressSampleCount(item));
+
+  if (confidenceData.every((value) => value == null)) {
+    const hasHistoricalGap = progressData.some(
+      (item) => item && item.quality_value_source === "historical_missing",
+    );
+    chart.setOption(
+      {
+        title: {
+          text: hasHistoricalGap ? "历史数据缺失" : "暂无质量分数数据",
+          left: "center",
+          top: "middle",
+          textStyle: {
+            fontSize: 14,
+            color: "#999",
+          },
+        },
+        xAxis: { type: "category", data: [] },
+        yAxis: [
+          { type: "value", name: "置信度(%)" },
+          { type: "value", name: "样本数量" },
+        ],
+        series: [
+          { name: "置信度", type: "bar", data: [] },
+          { name: "样本数量", type: "line", data: [] },
+        ],
+      },
+      true,
+    );
+    return;
+  }
 
   const option = {
     tooltip: {
@@ -3158,10 +3327,31 @@ function initializeEmotionPatternsChart(emotionData) {
     return;
   }
 
-  const data = emotionData.map((item) => ({
-    name: item.pattern || "未知模式",
-    value: item.frequency || 0,
-  }));
+  const data = emotionData
+    .map((item) => ({
+      name: getStylePatternLabel(item) || "未知模式",
+      value: getStylePatternNumericValue(item),
+    }))
+    .filter((item) => item.name && item.value != null);
+
+  if (data.length === 0) {
+    chart.setOption(
+      {
+        title: {
+          text: "历史模式数据缺失",
+          left: "center",
+          top: "middle",
+          textStyle: {
+            fontSize: 14,
+            color: "#999",
+          },
+        },
+        series: [{ name: "情感表达", type: "pie", data: [] }],
+      },
+      true,
+    );
+    return;
+  }
 
   const option = {
     tooltip: {
@@ -3224,8 +3414,33 @@ function initializeLanguageStyleChart(languageData) {
     return;
   }
 
-  const styles = languageData.map((item) => item.style || "未知风格");
-  const frequencies = languageData.map((item) => item.frequency || 0);
+  const chartData = languageData
+    .map((item) => ({
+      name: getStylePatternLabel(item) || "未知风格",
+      value: getStylePatternNumericValue(item),
+    }))
+    .filter((item) => item.name && item.value != null);
+
+  if (chartData.length === 0) {
+    chart.setOption(
+      {
+        title: {
+          text: "历史模式数据缺失",
+          left: "center",
+          top: "middle",
+          textStyle: {
+            fontSize: 14,
+            color: "#999",
+          },
+        },
+        xAxis: { type: "category", data: [] },
+        yAxis: { type: "value", name: "使用频率" },
+        series: [{ name: "语言风格", type: "bar", data: [] }],
+      },
+      true,
+    );
+    return;
+  }
 
   const option = {
     tooltip: {
@@ -3236,7 +3451,7 @@ function initializeLanguageStyleChart(languageData) {
     },
     xAxis: {
       type: "category",
-      data: styles,
+      data: chartData.map((item) => item.name),
       axisLabel: {
         rotate: 45,
       },
@@ -3249,7 +3464,7 @@ function initializeLanguageStyleChart(languageData) {
       {
         name: "语言风格",
         type: "bar",
-        data: frequencies,
+        data: chartData.map((item) => item.value),
         itemStyle: {
           color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
             { offset: 0, color: "#ff9800" },
@@ -3299,8 +3514,36 @@ function initializeTopicPreferencesChart(topicData) {
     return;
   }
 
-  const topics = topicData.map((item) => item.topic || "未知主题");
-  const interestLevels = topicData.map((item) => item.interest_level || 0);
+  const chartData = topicData
+    .map((item) => ({
+      name: getStylePatternLabel(item) || "未知主题",
+      value: getStylePatternNumericValue(item),
+    }))
+    .filter((item) => item.name && item.value != null);
+
+  if (chartData.length === 0) {
+    chart.setOption(
+      {
+        title: {
+          text: "历史模式数据缺失",
+          left: "center",
+          top: "middle",
+          textStyle: {
+            fontSize: 14,
+            color: "#999",
+          },
+        },
+        radar: {
+          indicator: [],
+          center: ["50%", "50%"],
+          radius: "75%",
+        },
+        series: [{ name: "主题偏好", type: "radar", data: [] }],
+      },
+      true,
+    );
+    return;
+  }
 
   const option = {
     tooltip: {
@@ -3308,7 +3551,7 @@ function initializeTopicPreferencesChart(topicData) {
       formatter: "{b}: {c}%",
     },
     radar: {
-      indicator: topics.map((topic) => ({ name: topic, max: 100 })),
+      indicator: chartData.map((item) => ({ name: item.name, max: 100 })),
       center: ["50%", "50%"],
       radius: "75%",
     },
@@ -3318,7 +3561,7 @@ function initializeTopicPreferencesChart(topicData) {
         type: "radar",
         data: [
           {
-            value: interestLevels,
+            value: chartData.map((item) => item.value),
             name: "兴趣水平",
             itemStyle: { color: "#9c27b0" },
             areaStyle: { opacity: 0.3 },
@@ -3352,9 +3595,9 @@ function renderLearningPatterns(patterns) {
       .map(
         (pattern) => `
             <div class="pattern-item">
-                <span class="pattern-name">${pattern.pattern || "未知模式"}</span>
-                <span class="pattern-frequency">频率: ${pattern.frequency || 0}</span>
-                <span class="pattern-confidence">置信度: ${pattern.confidence || 0}%</span>
+                <span class="pattern-name">${getStylePatternLabel(pattern) || "未知模式"}</span>
+                <span class="pattern-frequency">频率: ${getStylePatternNumericValue(pattern) ?? 0}</span>
+                <span class="pattern-confidence">置信度: ${pattern.confidence ?? "--"}${pattern.confidence != null ? "%" : ""}</span>
             </div>
         `,
       )
@@ -3371,9 +3614,9 @@ function renderLearningPatterns(patterns) {
       .map(
         (pattern) => `
             <div class="pattern-item">
-                <span class="pattern-name">${pattern.style || "未知风格"}</span>
-                <span class="pattern-context">环境: ${pattern.context || "general"}</span>
-                <span class="pattern-frequency">频率: ${pattern.frequency || 0}</span>
+                <span class="pattern-name">${getStylePatternLabel(pattern) || "未知风格"}</span>
+                <span class="pattern-context">来源: ${pattern.value_source || "normalized"}</span>
+                <span class="pattern-frequency">频率: ${getStylePatternNumericValue(pattern) ?? 0}</span>
             </div>
         `,
       )
@@ -3390,9 +3633,9 @@ function renderLearningPatterns(patterns) {
       .map(
         (pattern) => `
             <div class="pattern-item">
-                <span class="pattern-name">${pattern.topic || "未知主题"}</span>
-                <span class="pattern-style">风格: ${pattern.response_style || "normal"}</span>
-                <span class="pattern-interest">兴趣度: ${pattern.interest_level || 0}%</span>
+                <span class="pattern-name">${getStylePatternLabel(pattern) || "未知主题"}</span>
+                <span class="pattern-style">来源: ${pattern.value_source || "normalized"}</span>
+                <span class="pattern-interest">兴趣度: ${getStylePatternNumericValue(pattern) ?? 0}%</span>
             </div>
         `,
       )

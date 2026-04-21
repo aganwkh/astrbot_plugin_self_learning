@@ -122,7 +122,7 @@
         "description": "最少学习消息数量",
         "type": "int",
         "hint": "开始学习所需的最少消息数量",
-        "default": 50
+        "default": 25
       },
       "max_messages_per_batch": {
         "description": "每批处理的最大消息数量",

@@ -19,6 +19,8 @@ from ..models.orm import (
     LearningReinforcementFeedback,
     LearningOptimizationLog
 )
+from ..models.orm.message import RawMessage, FilteredMessage
+from ..models.orm.performance import LearningPerformanceHistory
 
 
 class PersonaLearningReviewRepository(BaseRepository[PersonaLearningReview]):
@@ -340,6 +342,154 @@ class StyleLearningReviewRepository(BaseRepository[StyleLearningReview]):
                 "latest_update": None
             }
 
+
+    async def get_statistics(self) -> Dict[str, Any]:
+        """鑾峰彇椋庢牸瀛︿範缁熻锛屼娇鐢ㄧ湡瀹炴暟鎹簮"""
+        try:
+            def _parse_payload(raw_value: Any) -> Any:
+                if isinstance(raw_value, str):
+                    text = raw_value.strip()
+                    if not text:
+                        return None
+                    try:
+                        import json
+
+                        return json.loads(text)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        return None
+                return raw_value
+
+            def _collect_confidences(payload: Any) -> List[float]:
+                values: List[float] = []
+                if isinstance(payload, dict):
+                    for key, value in payload.items():
+                        if key == "confidence" and isinstance(value, (int, float)):
+                            numeric = float(value)
+                            if numeric > 1.0:
+                                numeric = numeric / 100.0
+                            values.append(max(0.0, min(numeric, 1.0)))
+                        else:
+                            values.extend(_collect_confidences(value))
+                elif isinstance(payload, list):
+                    for item in payload:
+                        values.extend(_collect_confidences(item))
+                return values
+
+            review_stats_stmt = select(
+                func.count().label("total_reviews"),
+                func.count(func.distinct(StyleLearningReview.type)).label("unique_styles"),
+                func.count().filter(StyleLearningReview.status == 'pending').label("pending_reviews"),
+                func.count().filter(StyleLearningReview.status == 'approved').label("approved_reviews"),
+                func.count().filter(StyleLearningReview.status == 'rejected').label("rejected_reviews"),
+                func.max(StyleLearningReview.timestamp).label("latest_update"),
+            )
+            review_stats = (await self.session.execute(review_stats_stmt)).one()
+
+            review_payload_rows = (
+                await self.session.execute(select(StyleLearningReview.learned_patterns))
+            ).all()
+            confidence_values: List[float] = []
+            for row in review_payload_rows:
+                confidence_values.extend(_collect_confidences(_parse_payload(row[0])))
+
+            batch_row = (
+                await self.session.execute(
+                    select(
+                        func.count(LearningBatch.id),
+                        func.sum(LearningBatch.filtered_count),
+                        func.sum(LearningBatch.message_count),
+                        func.sum(LearningBatch.processed_messages),
+                        func.max(
+                            func.coalesce(
+                                LearningBatch.end_time, LearningBatch.start_time
+                            )
+                        ),
+                    )
+                )
+            ).one()
+            batch_count = int(batch_row[0] or 0)
+            total_samples = 0
+            raw_message_count_source = "unavailable"
+            if batch_count > 0:
+                for source, value in (
+                    ("learning_batches.filtered_count_sum", batch_row[1]),
+                    ("learning_batches.message_count_sum", batch_row[2]),
+                    ("learning_batches.processed_messages_sum", batch_row[3]),
+                ):
+                    if value is not None and int(value) > 0:
+                        total_samples = int(value)
+                        raw_message_count_source = source
+                        break
+                if raw_message_count_source == "unavailable":
+                    for source, value in (
+                        ("learning_batches.filtered_count_sum", batch_row[1]),
+                        ("learning_batches.message_count_sum", batch_row[2]),
+                        ("learning_batches.processed_messages_sum", batch_row[3]),
+                    ):
+                        if value is not None:
+                            total_samples = int(value or 0)
+                            raw_message_count_source = source
+                            break
+            else:
+                filtered_table_count = (
+                    await self.session.execute(select(func.count()).select_from(FilteredMessage))
+                ).scalar()
+                if filtered_table_count is not None:
+                    total_samples = int(filtered_table_count or 0)
+                    raw_message_count_source = "filtered_messages_table_count"
+                else:
+                    raw_table_count = (
+                        await self.session.execute(select(func.count()).select_from(RawMessage))
+                    ).scalar()
+                    if raw_table_count is not None:
+                        total_samples = int(raw_table_count or 0)
+                        raw_message_count_source = "raw_messages_table_count"
+
+            performance_latest = (
+                await self.session.execute(
+                    select(func.max(LearningPerformanceHistory.timestamp))
+                )
+            ).scalar()
+            latest_candidates = [
+                float(value)
+                for value in (
+                    review_stats.latest_update,
+                    batch_row[4],
+                    performance_latest,
+                )
+                if value is not None
+            ]
+
+            return {
+                "unique_styles": int(review_stats.unique_styles or 0),
+                "avg_confidence": (
+                    round(sum(confidence_values) / len(confidence_values), 4)
+                    if confidence_values
+                    else None
+                ),
+                "total_samples": total_samples,
+                "latest_update": max(latest_candidates) if latest_candidates else None,
+                "total_reviews": int(review_stats.total_reviews or 0),
+                "pending_reviews": int(review_stats.pending_reviews or 0),
+                "approved_reviews": int(review_stats.approved_reviews or 0),
+                "rejected_reviews": int(review_stats.rejected_reviews or 0),
+                "raw_message_count_source": raw_message_count_source,
+                "confidence_value_count": len(confidence_values),
+            }
+        except Exception as e:
+            logger.error(f"[StyleLearningReviewRepository] 鑾峰彇缁熻鏁版嵁澶辫触: {e}")
+            return {
+                "unique_styles": 0,
+                "avg_confidence": None,
+                "total_samples": 0,
+                "latest_update": None,
+                "total_reviews": 0,
+                "pending_reviews": 0,
+                "approved_reviews": 0,
+                "rejected_reviews": 0,
+                "raw_message_count_source": "unavailable",
+                "confidence_value_count": 0,
+            }
 
 class StyleLearningPatternRepository(BaseRepository[StyleLearningPattern]):
     """风格学习模式 Repository"""

@@ -4,7 +4,7 @@
 import asyncio
 import json
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
@@ -29,8 +29,41 @@ class LearningSession:
     messages_processed: int = 0
     filtered_messages: int = 0
     style_updates: int = 0
-    quality_score: float = 0.0
+    quality_score: Optional[float] = None
     success: bool = False
+
+
+@dataclass
+class SourceMessageContext:
+    messages: List[Dict[str, Any]]
+    session_id: str = ""
+    group_id: str = ""
+    chat_key: str = ""
+    fetch_count: int = 0
+    fetch_path: str = "none"
+    fallback_input_count: int = 0
+    degraded_reason: str = ""
+
+    @property
+    def degraded_mode(self) -> bool:
+        return bool(self.degraded_reason)
+
+
+@dataclass
+class BatchQualityEvaluation:
+    metrics: Any = None
+    batch_quality_score: Optional[float] = None
+    batch_quality_raw_value: Optional[float] = None
+    batch_quality_write_source: str = "unavailable"
+    batch_quality_write_path: str = "none"
+    quality_monitor_invoked: bool = False
+    quality_monitor_result: Dict[str, Any] = None
+    quality_monitor_skipped_reason: str = ""
+    provider_ready_when_quality_scored: bool = False
+
+    def __post_init__(self) -> None:
+        if self.quality_monitor_result is None:
+            self.quality_monitor_result = {}
 
 
 class ProgressiveLearningService:
@@ -172,6 +205,113 @@ class ProgressiveLearningService:
             ],
         }
 
+    async def _resolve_source_messages(
+        self,
+        group_id: str,
+        filtered_messages: List[Dict[str, Any]],
+        *,
+        session_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> SourceMessageContext:
+        recent_limit = limit or self._get_refine_recent_message_limit()
+        current_session_id = session_id or (
+            self._group_sessions[group_id].session_id
+            if group_id in self._group_sessions
+            else ""
+        )
+        chat_key = group_id
+        fallback_input_count = len(filtered_messages or [])
+
+        source_context = SourceMessageContext(
+            messages=[],
+            session_id=current_session_id,
+            group_id=group_id,
+            chat_key=chat_key,
+            fetch_count=0,
+            fetch_path="none",
+            fallback_input_count=fallback_input_count,
+        )
+
+        if current_session_id and hasattr(self.db_manager, "get_session"):
+            try:
+                from sqlalchemy import select
+
+                from ...models.orm.learning import LearningSession as LearningSessionORM
+
+                async with self.db_manager.get_session() as session:
+                    stmt = select(LearningSessionORM).where(
+                        LearningSessionORM.session_id == current_session_id
+                    )
+                    session_row = (await session.execute(stmt)).scalar_one_or_none()
+                    if session_row and getattr(session_row, "group_id", None):
+                        chat_key = session_row.group_id
+                        source_context.chat_key = chat_key
+            except Exception as exc:
+                logger.warning(
+                    "[LearningBatch] source session lookup failed "
+                    f"source_fetch_session_id={current_session_id} "
+                    f"source_fetch_group_id={group_id} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+
+        if hasattr(self.db_manager, "get_recent_raw_messages"):
+            try:
+                raw_messages = await self.db_manager.get_recent_raw_messages(
+                    chat_key, limit=recent_limit
+                )
+                if isinstance(raw_messages, list) and raw_messages:
+                    source_context.messages = raw_messages
+                    source_context.fetch_count = len(raw_messages)
+                    source_context.fetch_path = "raw_recent_messages"
+            except Exception as exc:
+                logger.warning(
+                    "[LearningBatch] raw source fetch failed "
+                    f"source_fetch_session_id={current_session_id} "
+                    f"source_fetch_group_id={group_id} "
+                    f"source_fetch_chat_key={chat_key} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+
+        if not source_context.messages and filtered_messages:
+            source_context.messages = list(filtered_messages)
+            source_context.fetch_count = len(filtered_messages)
+            source_context.fetch_path = "filtered_messages_fallback"
+            source_context.degraded_reason = "missing_raw_chat_records_fallback"
+
+        if (
+            not source_context.messages
+            and hasattr(self.db_manager, "get_recent_filtered_messages")
+        ):
+            try:
+                recent_filtered = await self.db_manager.get_recent_filtered_messages(
+                    group_id, limit=recent_limit
+                )
+                if isinstance(recent_filtered, list) and recent_filtered:
+                    source_context.messages = recent_filtered
+                    source_context.fetch_count = len(recent_filtered)
+                    source_context.fetch_path = "recent_filtered_messages_fallback"
+                    source_context.degraded_reason = "missing_raw_chat_records_fallback"
+            except Exception as exc:
+                logger.warning(
+                    "[LearningBatch] filtered fallback fetch failed "
+                    f"source_fetch_session_id={current_session_id} "
+                    f"source_fetch_group_id={group_id} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+
+        logger.info(
+            "[LearningBatch] source resolution "
+            f"source_fetch_session_id={source_context.session_id} "
+            f"source_fetch_group_id={source_context.group_id} "
+            f"source_fetch_chat_key={source_context.chat_key} "
+            f"source_fetch_count={source_context.fetch_count} "
+            f"source_fetch_path={source_context.fetch_path} "
+            f"fallback_input_count={source_context.fallback_input_count} "
+            f"degraded_reason={source_context.degraded_reason or 'none'} "
+            f"final_source_message_count={len(source_context.messages)}"
+        )
+        return source_context
+
     def _build_refine_analysis_payload(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
         style_analysis = analysis_data.get("style_analysis")
         style_profile = analysis_data.get("style_profile")
@@ -204,11 +344,116 @@ class ProgressiveLearningService:
 
         return payload
 
+    def _build_refine_prompt_variant(
+        self,
+        *,
+        current_persona: Dict[str, Any],
+        default_persona: Dict[str, Any],
+        analysis_data: Dict[str, Any],
+        recent_messages: List[Dict[str, Any]],
+        recent_limit: int,
+        prompt_max_len: int,
+        description_max_len: int,
+        variant_name: str,
+    ) -> Dict[str, Any]:
+        compact_current_persona = {
+            "name": current_persona.get("name", default_persona.get("name", "default")),
+            "prompt": self._compact_refine_value(
+                current_persona.get("prompt", default_persona.get("prompt", "")),
+                max_depth=0,
+                max_str_len=prompt_max_len,
+            ),
+            "description": self._compact_refine_value(
+                current_persona.get(
+                    "description",
+                    current_persona.get("prompt", ""),
+                ),
+                max_depth=0,
+                max_str_len=description_max_len,
+            ),
+            "style_parameters": self._compact_refine_value(
+                current_persona.get("style_parameters", {}),
+                max_depth=1,
+                max_items=6,
+            ),
+        }
+        refine_payload = self._build_refine_analysis_payload(analysis_data)
+        recent_messages_payload = self._build_recent_messages_refine_payload(
+            recent_messages,
+            limit=recent_limit,
+        )
+        prompt = (
+            self.prompts.PROGRESSIVE_LEARNING_GENERATE_UPDATED_PERSONA_PROMPT.format(
+                current_persona_json=json.dumps(
+                    compact_current_persona,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=self._json_serializer,
+                ),
+                style_analysis_json=json.dumps(
+                    refine_payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=self._json_serializer,
+                ),
+            )
+            + "\n\n銆愭渶杩戞秷鎭憳瑕併€慭n"
+            + json.dumps(
+                recent_messages_payload,
+                ensure_ascii=False,
+                indent=2,
+                default=self._json_serializer,
+            )
+            + "\n\n銆愮簿鐐肩害鏉熴€戣浠呬緷鎹帇缂╁悗鐨勫垎鏋愬拰鏈€杩戞秷鎭憳瑕佽繘琛屾洿鏂帮紱浼樺厛淇濈暀鍘熸湁浜烘牸妗嗘灦锛岄伩鍏嶆墿鍐欐棤鍏冲唴瀹广€?"
+        )
+        return {
+            "name": variant_name,
+            "prompt": prompt,
+            "message_count": refine_payload.get("message_count", 0),
+            "recent_message_count": recent_messages_payload.get("recent_message_count", 0),
+            "prompt_chars": len(prompt),
+        }
+
+    def _build_refine_prompt_variants(
+        self,
+        *,
+        current_persona: Dict[str, Any],
+        default_persona: Dict[str, Any],
+        analysis_data: Dict[str, Any],
+        recent_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        base_limit = self._get_refine_recent_message_limit()
+        plan: List[Tuple[str, int, int, int]] = [
+            ("full_context", base_limit, 2500, 500),
+            ("compact_context", max(5, min(base_limit // 2 or 5, 12)), 1600, 320),
+            ("minimal_context", 5, 1000, 220),
+        ]
+        variants: List[Dict[str, Any]] = []
+        seen_limits = set()
+        for variant_name, recent_limit, prompt_max_len, description_max_len in plan:
+            if recent_limit in seen_limits:
+                continue
+            seen_limits.add(recent_limit)
+            variants.append(
+                self._build_refine_prompt_variant(
+                    current_persona=current_persona,
+                    default_persona=default_persona,
+                    analysis_data=analysis_data,
+                    recent_messages=recent_messages,
+                    recent_limit=recent_limit,
+                    prompt_max_len=prompt_max_len,
+                    description_max_len=description_max_len,
+                    variant_name=variant_name,
+                )
+            )
+        return variants
+
     async def _run_refine_with_timeout_retry(
         self,
         llm_adapter,
         *,
         prompt: str,
+        prompt_variants: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
         temperature: float = 0.6,
         timeout_seconds: Optional[float] = None,
@@ -223,10 +468,15 @@ class ProgressiveLearningService:
         for attempt in range(max_retry + 1):
             attempts = attempt + 1
             attempt_start = time.perf_counter()
+            prompt_variant = None
+            prompt_to_use = prompt
+            if prompt_variants:
+                prompt_variant = prompt_variants[min(attempt, len(prompt_variants) - 1)]
+                prompt_to_use = str(prompt_variant.get("prompt") or prompt)
             try:
                 response = await asyncio.wait_for(
                     llm_adapter.refine_chat_completion(
-                        prompt=prompt,
+                        prompt=prompt_to_use,
                         system_prompt=system_prompt,
                         temperature=temperature,
                     ),
@@ -245,7 +495,9 @@ class ProgressiveLearningService:
                 logger.info(
                     f"[LearningBatch] refine_call_success attempts={attempts} "
                     f"attempt_duration={duration:.2f}s total_duration={total_duration:.2f}s "
-                    f"timeout_seconds={timeout_seconds}"
+                    f"timeout_seconds={timeout_seconds} "
+                    f"prompt_variant={prompt_variant.get('name', 'default') if prompt_variant else 'default'} "
+                    f"prompt_chars={len(prompt_to_use)}"
                 )
                 return parsed_response, {
                     "success": True,
@@ -255,17 +507,23 @@ class ProgressiveLearningService:
                     "last_error": None,
                     "degraded_mode": False,
                     "needs_refine_retry": False,
+                    "prompt_variant": prompt_variant.get("name") if prompt_variant else "default",
+                    "prompt_chars": len(prompt_to_use),
                 }
             except asyncio.TimeoutError:
                 last_error = f"timeout_after_{timeout_seconds:.2f}s"
                 logger.warning(
                     f"[LearningBatch] refine_call_timeout attempt={attempts} "
-                    f"timeout_seconds={timeout_seconds}"
+                    f"timeout_seconds={timeout_seconds} "
+                    f"prompt_variant={prompt_variant.get('name', 'default') if prompt_variant else 'default'} "
+                    f"prompt_chars={len(prompt_to_use)}"
                 )
             except Exception as exc:
                 last_error = str(exc)
                 logger.warning(
-                    f"[LearningBatch] refine_call_failed attempt={attempts} error={exc}"
+                    f"[LearningBatch] refine_call_failed attempt={attempts} error={exc} "
+                    f"prompt_variant={prompt_variant.get('name', 'default') if prompt_variant else 'default'} "
+                    f"prompt_chars={len(prompt_to_use)}"
                 )
 
             if attempts <= max_retry:
@@ -285,6 +543,11 @@ class ProgressiveLearningService:
             "last_error": last_error,
             "degraded_mode": True,
             "needs_refine_retry": True,
+            "prompt_variant": (
+                prompt_variants[min(attempts - 1, len(prompt_variants) - 1)].get("name")
+                if prompt_variants
+                else "default"
+            ),
         }
 
     def _resolve_umo(self, group_id: str) -> str:
@@ -703,11 +966,15 @@ class ProgressiveLearningService:
                 updated_persona = current_persona.copy()
                 logger.warning("updated_persona为None，使用current_persona的副本")
                 
-            quality_metrics = await self.quality_monitor.evaluate_learning_batch(
-                current_persona,
-                updated_persona,
-                filtered_messages
+            quality_evaluation = await self._evaluate_batch_quality(
+                group_id=group_id,
+                current_persona=current_persona,
+                updated_persona=updated_persona,
+                learning_messages=filtered_messages,
+                analysis_data=self._extract_analysis_data(style_analysis),
+                write_path="progressive_learning.execute_learning_batch.performance_only",
             )
+            quality_metrics = quality_evaluation.metrics
 
             # 9. 应用学习更新（对话风格学习不判断质量直接应用，人格学习加入审查）
             # 注意：对话风格（表达模式）学习总是成功，人格学习在_apply_learning_updates中会加入审查
@@ -738,7 +1005,11 @@ class ProgressiveLearningService:
                 group_id=group_id,
                 batch_result=batch_result,
             )
-            logger.info(f"学习更新已应用（对话风格学习已完成，人格学习已加入审查），质量得分: {quality_metrics.consistency_score:.3f} for group {group_id}")
+            logger.info(
+                "学习更新已应用（对话风格学习已完成，人格学习已加入审查），"
+                f"质量得分: {(quality_evaluation.batch_quality_score if quality_evaluation.batch_quality_score is not None else 0.0):.3f} "
+                f"for group {group_id}"
+            )
             success = batch_result["success"]
             
             # 10. 【新增】保存学习性能记录
@@ -751,7 +1022,11 @@ class ProgressiveLearningService:
             await self.db_manager.save_learning_performance_record(group_id, {
                 'session_id': self._group_sessions[group_id].session_id if group_id in self._group_sessions else '',
                 'timestamp': time.time(),
-                'quality_score': quality_metrics.consistency_score,
+                'quality_score': (
+                    quality_evaluation.batch_quality_score
+                    if quality_evaluation.batch_quality_score is not None
+                    else 0.0
+                ),
                 'learning_time': (datetime.now() - batch_start_time).total_seconds(),
                 'success': success,
                 'successful_pattern': successful_pattern,
@@ -766,7 +1041,11 @@ class ProgressiveLearningService:
             if group_session:
                 group_session.messages_processed += len(unprocessed_messages)
                 group_session.filtered_messages += len(filtered_messages)
-                group_session.quality_score = quality_metrics.consistency_score
+                group_session.quality_score = (
+                    quality_evaluation.batch_quality_score
+                    if quality_evaluation.batch_quality_score is not None
+                    else 0.0
+                )
                 group_session.success = success
                 await self.db_manager.save_learning_session_record(group_id, group_session.__dict__)
             
@@ -924,6 +1203,149 @@ class ProgressiveLearningService:
         if hasattr(style_analysis, "data") and isinstance(style_analysis.data, dict):
             return dict(style_analysis.data)
         return {}
+
+    @staticmethod
+    def _coerce_optional_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _summarize_quality_metrics(self, metrics: Any) -> Dict[str, Any]:
+        if metrics is None:
+            return {}
+        summary: Dict[str, Any] = {}
+        for key in (
+            "consistency_score",
+            "style_stability",
+            "vocabulary_diversity",
+            "emotional_balance",
+            "coherence_score",
+        ):
+            numeric_value = self._coerce_optional_float(getattr(metrics, key, None))
+            if numeric_value is not None:
+                summary[key] = round(numeric_value, 4)
+        return summary
+
+    def _resolve_quality_provider_state(self) -> bool:
+        quality_monitor = getattr(self, "quality_monitor", None)
+        llm_adapter = getattr(quality_monitor, "llm_adapter", None)
+        if llm_adapter is None:
+            return False
+        has_filter_provider = bool(
+            getattr(llm_adapter, "has_filter_provider", lambda: False)()
+        )
+        has_refine_provider = bool(
+            getattr(llm_adapter, "has_refine_provider", lambda: False)()
+        )
+        return has_filter_provider or has_refine_provider
+
+    def _compute_batch_quality_score(
+        self,
+        metrics: Any,
+        analysis_data: Dict[str, Any],
+    ) -> Tuple[Optional[float], Optional[float], str]:
+        metric_values = self._summarize_quality_metrics(metrics)
+        available_values = [
+            value for value in metric_values.values() if value is not None
+        ]
+        if available_values:
+            aggregate_score = round(sum(available_values) / len(available_values), 4)
+            raw_value = metric_values.get("consistency_score")
+            return aggregate_score, raw_value, "quality_monitor.aggregate_metrics"
+
+        confidence = None
+        for key in ("confidence", "analysis_confidence", "style_confidence"):
+            confidence = self._coerce_optional_float(analysis_data.get(key))
+            if confidence is not None:
+                break
+        if confidence is not None:
+            if confidence > 1.0:
+                confidence = confidence / 100.0
+            confidence = max(0.0, min(confidence, 1.0))
+            return round(confidence, 4), confidence, "style_analysis.confidence_fallback"
+
+        return None, metric_values.get("consistency_score"), "unavailable"
+
+    async def _evaluate_batch_quality(
+        self,
+        *,
+        group_id: str,
+        current_persona: Dict[str, Any],
+        updated_persona: Dict[str, Any],
+        learning_messages: List[Dict[str, Any]],
+        analysis_data: Optional[Dict[str, Any]] = None,
+        write_path: str,
+    ) -> BatchQualityEvaluation:
+        analysis_data = analysis_data or {}
+        provider_ready = self._resolve_quality_provider_state()
+        quality_monitor = getattr(self, "quality_monitor", None)
+        if not quality_monitor or not hasattr(quality_monitor, "evaluate_learning_batch"):
+            skipped_reason = "quality_monitor_unavailable"
+            batch_quality_score, raw_value, source = self._compute_batch_quality_score(
+                None,
+                analysis_data,
+            )
+            metrics_summary = self._summarize_quality_metrics(None)
+            logger.warning(
+                f"[LearningBatch] group={group_id} quality_monitor_invoked=False "
+                f"metrics_summary={metrics_summary} "
+                f"quality_monitor_skipped_reason={skipped_reason} "
+                f"provider_ready_when_quality_scored={provider_ready} "
+                f"batch_quality_score={batch_quality_score} "
+                f"batch_quality_raw_value={raw_value} "
+                f"batch_quality_write_source={source} "
+                f"batch_quality_write_path={write_path}"
+            )
+            return BatchQualityEvaluation(
+                metrics=None,
+                batch_quality_score=batch_quality_score,
+                batch_quality_raw_value=raw_value,
+                batch_quality_write_source=source,
+                batch_quality_write_path=write_path,
+                quality_monitor_invoked=False,
+                quality_monitor_result={},
+                quality_monitor_skipped_reason=skipped_reason,
+                provider_ready_when_quality_scored=provider_ready,
+            )
+
+        metrics = await quality_monitor.evaluate_learning_batch(
+            current_persona,
+            updated_persona,
+            learning_messages,
+        )
+        result_summary = self._summarize_quality_metrics(metrics)
+        batch_quality_score, raw_value, source = self._compute_batch_quality_score(
+            metrics,
+            analysis_data,
+        )
+        skipped_reason = ""
+        if batch_quality_score is None:
+            skipped_reason = "quality_score_unavailable_after_monitor"
+        logger.info(
+            f"[LearningBatch] group={group_id} quality_monitor_invoked=True "
+            f"metrics_summary={result_summary} "
+            f"quality_monitor_result={result_summary} "
+            f"quality_monitor_skipped_reason={skipped_reason or 'none'} "
+            f"provider_ready_when_quality_scored={provider_ready} "
+            f"batch_quality_score={batch_quality_score} "
+            f"batch_quality_raw_value={raw_value} "
+            f"batch_quality_write_source={source} "
+            f"batch_quality_write_path={write_path}"
+        )
+        return BatchQualityEvaluation(
+            metrics=metrics,
+            batch_quality_score=batch_quality_score,
+            batch_quality_raw_value=raw_value,
+            batch_quality_write_source=source,
+            batch_quality_write_path=write_path,
+            quality_monitor_invoked=True,
+            quality_monitor_result=result_summary,
+            quality_monitor_skipped_reason=skipped_reason,
+            provider_ready_when_quality_scored=provider_ready,
+        )
 
     def _build_fallback_style_analysis(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """当 LLM 风格分析失败时，至少基于真实消息构建可消费的学习结果。"""
@@ -1157,6 +1579,10 @@ class ProgressiveLearningService:
             "reason": batch_result.get("reason", ""),
             "style_features": analysis_data.get("style_features", []),
             "message_count": analysis_data.get("message_count", 0),
+            "source_message_count": analysis_data.get("source_message_count", 0),
+            "source_fetch_path": analysis_data.get("source_fetch_path", ""),
+            "source_fetch_chat_key": analysis_data.get("source_fetch_chat_key", ""),
+            "fallback_input_count": analysis_data.get("fallback_input_count", 0),
         }
 
         successful_pattern: Dict[str, Any] = {}
@@ -1282,14 +1708,17 @@ class ProgressiveLearningService:
         current_persona: Optional[Dict[str, Any]],
     ):
         """执行真实风格分析并生成可落地的人格学习内容。"""
+        source_context = await self._resolve_source_messages(group_id, filtered_messages)
+        source_messages = source_context.messages or list(filtered_messages)
+
         style_analysis = await self._execute_style_analysis_background(
             group_id,
-            filtered_messages,
+            source_messages,
         )
         style_analysis = self._normalize_style_analysis_result(
             group_id,
             style_analysis,
-            filtered_messages,
+            source_messages,
         )
 
         base_persona = current_persona or {"prompt": "默认人格", "name": "default"}
@@ -1298,7 +1727,7 @@ class ProgressiveLearningService:
             group_id,
             base_persona,
             style_analysis,
-            filtered_messages,
+            source_messages,
         )
         refine_stage_duration = time.perf_counter() - refine_stage_start
         logger.info(
@@ -1313,6 +1742,23 @@ class ProgressiveLearningService:
             updated_persona = dict(base_persona)
 
         analysis_data = self._extract_analysis_data(style_analysis)
+        analysis_data["source_message_count"] = len(source_messages)
+        analysis_data["source_fetch_session_id"] = source_context.session_id
+        analysis_data["source_fetch_group_id"] = source_context.group_id
+        analysis_data["source_fetch_chat_key"] = source_context.chat_key
+        analysis_data["source_fetch_count"] = source_context.fetch_count
+        analysis_data["source_fetch_path"] = source_context.fetch_path
+        analysis_data["fallback_input_count"] = source_context.fallback_input_count
+        analysis_data["final_source_message_count"] = len(source_messages)
+        if source_context.degraded_reason:
+            analysis_data["degraded_mode"] = True
+            existing_degraded_reason = analysis_data.get("degraded_reason")
+            if existing_degraded_reason:
+                analysis_data["degraded_reason"] = (
+                    f"{existing_degraded_reason}; {source_context.degraded_reason}"
+                )
+            else:
+                analysis_data["degraded_reason"] = source_context.degraded_reason
         if isinstance(refine_meta, dict) and refine_meta:
             analysis_data["refine_retry_meta"] = refine_meta
             analysis_data["refine_attempts"] = refine_meta.get("attempts", 0)
@@ -1351,7 +1797,7 @@ class ProgressiveLearningService:
         if not analysis_data.get("learning_insights"):
             analysis_data["learning_insights"] = self._build_learning_insights(
                 group_id,
-                filtered_messages,
+                source_messages,
                 analysis_data,
             )
 
@@ -1360,13 +1806,13 @@ class ProgressiveLearningService:
             replay_persona.setdefault("description", replay_persona.get("prompt", ""))
             logger.info(
                 f"[LearningBatch] group={group_id} trigger=memory_replay "
-                f"message_count={len(filtered_messages)}"
+                f"message_count={len(source_messages)}"
             )
             try:
                 replay_stage_start = time.perf_counter()
                 replay_result = await self.ml_analyzer.reinforcement_memory_replay(
                     group_id,
-                    filtered_messages,
+                    source_messages,
                     replay_persona,
                     from_learning_batch=True,
                 )
@@ -1374,7 +1820,7 @@ class ProgressiveLearningService:
                 logger.info(
                     f"[LearningBatch] group={group_id} stage=replay "
                     f"duration={replay_stage_duration:.2f}s "
-                    f"message_count={len(filtered_messages)}"
+                    f"message_count={len(source_messages)}"
                 )
                 if replay_result:
                     analysis_data["memory_replay_result"] = replay_result
@@ -1501,9 +1947,15 @@ class ProgressiveLearningService:
                 updated_persona = current_persona.copy()
                 logger.warning("_finalize_learning_batch: updated_persona为None，使用current_persona的副本")
 
-            quality_metrics = await self.quality_monitor.evaluate_learning_batch(
-                current_persona, updated_persona, filtered_messages
+            quality_evaluation = await self._evaluate_batch_quality(
+                group_id=group_id,
+                current_persona=current_persona,
+                updated_persona=updated_persona,
+                learning_messages=filtered_messages,
+                analysis_data=self._extract_analysis_data(style_analysis),
+                write_path="progressive_learning._finalize_learning_batch.learning_batch_insert",
             )
+            quality_metrics = quality_evaluation.metrics
 
             # 应用学习更新（对话风格学习不判断质量直接应用，人格学习加入审查）
             # 传递 style_analysis 用于保存对话风格学习记录
@@ -1541,7 +1993,11 @@ class ProgressiveLearningService:
                 group_id=group_id,
                 batch_result=batch_result,
             )
-            logger.info(f"学习更新已应用（对话风格学习已完成，人格学习已加入审查），质量得分: {quality_metrics.consistency_score:.3f} for group {group_id}")
+            logger.info(
+                "学习更新已应用（对话风格学习已完成，人格学习已加入审查），"
+                f"质量得分: {(quality_evaluation.batch_quality_score if quality_evaluation.batch_quality_score is not None else 0.0):.3f} "
+                f"for group {group_id}"
+            )
             success = batch_result["success"]
 
             # 记录学习批次到数据库（使用 ORM）
@@ -1549,6 +2005,19 @@ class ProgressiveLearningService:
                 batch_name = f"batch_{group_id}_{int(time.time())}"
                 start_time = batch_start_time.timestamp()
                 end_time = time.time()
+
+                logger.info(
+                    f"[LearningBatch] group={group_id} "
+                    f"metrics_summary={quality_evaluation.quality_monitor_result} "
+                    f"batch_quality_before_save={quality_evaluation.batch_quality_score} "
+                    f"batch_quality_raw_value={quality_evaluation.batch_quality_raw_value} "
+                    f"batch_quality_write_source={quality_evaluation.batch_quality_write_source} "
+                    f"batch_quality_write_path={quality_evaluation.batch_quality_write_path} "
+                    f"quality_monitor_invoked={quality_evaluation.quality_monitor_invoked} "
+                    f"quality_monitor_result={quality_evaluation.quality_monitor_result} "
+                    f"quality_monitor_skipped_reason={quality_evaluation.quality_monitor_skipped_reason or 'none'} "
+                    f"provider_ready_when_quality_scored={quality_evaluation.provider_ready_when_quality_scored}"
+                )
 
                 async with self.db_manager.get_session() as session:
                     from ...models.orm.learning import LearningBatch
@@ -1558,7 +2027,7 @@ class ProgressiveLearningService:
                         group_id=group_id,
                         start_time=start_time,
                         end_time=end_time,
-                        quality_score=quality_metrics.consistency_score,
+                        quality_score=quality_evaluation.batch_quality_score,
                         processed_messages=len(unprocessed_messages),
                         message_count=len(unprocessed_messages),
                         filtered_count=len(filtered_messages),
@@ -1566,6 +2035,12 @@ class ProgressiveLearningService:
                     )
                     session.add(batch_record)
                     await session.commit()
+                    await session.refresh(batch_record)
+                    logger.info(
+                        f"[LearningBatch] group={group_id} "
+                        f"batch_quality_after_save={batch_record.quality_score} "
+                        f"batch_id={batch_name}"
+                    )
                     logger.debug(f"学习批次记录已保存: {batch_name}")
             except Exception as e:
                 logger.debug(f"无法记录学习批次（不影响学习功能）: {e}")
@@ -1578,7 +2053,7 @@ class ProgressiveLearningService:
             await self.db_manager.save_learning_performance_record(group_id, {
                 'session_id': self._group_sessions[group_id].session_id if group_id in self._group_sessions else '',
                 'timestamp': time.time(),
-                'quality_score': quality_metrics.consistency_score,
+                'quality_score': quality_evaluation.batch_quality_score,
                 'learning_time': end_time - start_time,
                 'success': success,
                 'successful_pattern': successful_pattern,
@@ -1593,7 +2068,7 @@ class ProgressiveLearningService:
             if bg_session:
                 bg_session.messages_processed += len(unprocessed_messages)
                 bg_session.filtered_messages += len(filtered_messages)
-                bg_session.quality_score = quality_metrics.consistency_score
+                bg_session.quality_score = quality_evaluation.batch_quality_score
                 bg_session.success = success
                 await self.db_manager.save_learning_session_record(group_id, bg_session.__dict__)
 
@@ -1744,7 +2219,13 @@ class ProgressiveLearningService:
                         "style_parameters": self._compact_refine_value(current_persona.get("style_parameters", {}), max_depth=1, max_items=6),
                     }
                     refine_payload = self._build_refine_analysis_payload(analysis_data)
-                    recent_messages_payload = self._build_recent_messages_refine_payload(filtered_messages)
+                    source_context = await self._resolve_source_messages(
+                        group_id,
+                        filtered_messages,
+                    )
+                    recent_messages_payload = self._build_recent_messages_refine_payload(
+                        source_context.messages or filtered_messages
+                    )
 
                     prompt = (
                         self.prompts.PROGRESSIVE_LEARNING_GENERATE_UPDATED_PERSONA_PROMPT.format(
@@ -1755,16 +2236,24 @@ class ProgressiveLearningService:
                         + json.dumps(recent_messages_payload, ensure_ascii=False, indent=2, default=self._json_serializer)
                         + "\n\n【精炼约束】请仅依据压缩后的分析和最近消息摘要进行更新；优先保留原有人格框架，避免扩写无关内容。"
                     )
+                    prompt_variants = self._build_refine_prompt_variants(
+                        current_persona=current_persona,
+                        default_persona=default_persona,
+                        analysis_data=analysis_data,
+                        recent_messages=source_context.messages or filtered_messages,
+                    )
                     logger.info(
                         f"[LearningBatch] group={group_id} stage=refine_input "
                         f"message_count={refine_payload.get('message_count', 0)} "
                         f"recent_message_count={recent_messages_payload.get('recent_message_count', 0)} "
-                        f"prompt_chars={len(prompt)}"
+                        f"prompt_chars={len(prompt)} "
+                        f"prompt_variants={[variant.get('name') for variant in prompt_variants]}"
                     )
 
                     refined_persona, call_meta = await self._run_refine_with_timeout_retry(
                         llm_adapter,
                         prompt=prompt,
+                        prompt_variants=prompt_variants,
                         temperature=0.6,
                     )
                     refine_meta.update(call_meta)
@@ -1775,13 +2264,21 @@ class ProgressiveLearningService:
                             f"[LearningBatch] group={group_id} filter provider bound "
                             f"refine provider bound reinforce provider bound "
                             f"stage=refine success=True attempts={refine_meta.get('attempts', 0)} "
-                            f"duration={refine_meta['total_duration_seconds']:.2f}s"
+                            f"duration={refine_meta['total_duration_seconds']:.2f}s "
+                            f"degraded_mode={refine_meta.get('degraded_mode', False)} "
+                            f"prompt_variant={refine_meta.get('prompt_variant', 'default')}"
                         )
                         return refined_persona, refine_meta
 
                     refine_meta["degraded_mode"] = True
                     refine_meta["needs_refine_retry"] = True
                     refine_meta["last_error"] = refine_meta.get("last_error") or "refine_failed_use_fallback"
+                    logger.warning(
+                        f"[LearningBatch] group={group_id} stage=refine_degraded_fallback "
+                        f"reason={refine_meta['last_error']} "
+                        f"attempts={refine_meta.get('attempts', 0)} "
+                        f"prompt_variant={refine_meta.get('prompt_variant', 'default')}"
+                    )
                     fallback_persona = await self._generate_updated_persona(group_id, current_persona, style_analysis)
                     if not isinstance(fallback_persona, dict):
                         fallback_persona = dict(current_persona)
@@ -1936,8 +2433,12 @@ class ProgressiveLearningService:
             if 'learning_insights' in analysis_data:
                 insights = analysis_data['learning_insights']
                 if insights:
-                    learning_content.append(insights)
-                    logger.debug("找到 learning_insights 字段")
+                    if isinstance(insights, dict):
+                        insights_str = "\n".join([f"- {k}: {v}" for k, v in insights.items()])
+                        learning_content.append(f"【学习洞察】\n{insights_str}")
+                    else:
+                        learning_content.append(str(insights))
+                    logger.debug("找到 learning_insights 字段并格式化为字符串")
 
             # 新增：从 style_analysis 字段提取内容（StyleAnalyzer返回的结构）
             if not learning_content and 'style_analysis' in analysis_data:

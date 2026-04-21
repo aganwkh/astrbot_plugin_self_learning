@@ -70,6 +70,7 @@ class LightweightMLAnalyzer:
         """
         强化学习记忆重放：通过强化模型分析历史数据和新数据的关联性，优化学习策略
         """
+        method_start = time.perf_counter()
         providers_configured = getattr(self.llm_adapter, "providers_configured", 0) if self.llm_adapter else 0
         logger.info(
             f"[MLAnalyzer] MemoryReplay start group={group_id} "

@@ -3,6 +3,261 @@
  * Displays style learning results with stat cards, 4 ECharts charts,
  * pattern lists, and learning content tabs.
  */
+window.StyleLearningDataUtils = {
+  normalizeResultsPayload(data) {
+    var statistics = (data && data.statistics) || {};
+    var progress = this.normalizeProgressItems(
+      Array.isArray(data && (data.progress || data.style_progress))
+        ? data.progress || data.style_progress
+        : [],
+    );
+    return Object.assign({}, data || {}, {
+      statistics: statistics,
+      progress: progress,
+      style_progress: progress,
+      style_types_count:
+        statistics.style_type_count != null
+          ? statistics.style_type_count
+          : statistics.unique_styles || 0,
+      avg_confidence:
+        statistics.average_confidence != null
+          ? statistics.average_confidence
+          : statistics.avg_confidence != null
+            ? statistics.avg_confidence
+            : null,
+      total_samples:
+        statistics.raw_message_count != null
+          ? statistics.raw_message_count
+          : statistics.total_samples != null
+            ? statistics.total_samples
+            : 0,
+      raw_message_count_source: statistics.raw_message_count_source || "unavailable",
+      latest_update:
+        statistics.last_updated_at != null
+          ? statistics.last_updated_at
+          : statistics.latest_update || null,
+      has_confidence:
+        (statistics.confidence_value_count || 0) > 0 ||
+        statistics.average_confidence != null ||
+        statistics.avg_confidence != null,
+    });
+  },
+
+  normalizeProgressItems(items) {
+    if (!Array.isArray(items)) return [];
+    return items
+      .filter(function (item) {
+        return item && typeof item === "object";
+      })
+      .map(function (item) {
+        var quality = window.StyleLearningDataUtils.getProgressQualityValue(item);
+        var sample = window.StyleLearningDataUtils.getProgressSampleCount(item);
+        return {
+          group_id: item.group_id || null,
+          label: window.StyleLearningDataUtils.getProgressLabel(item),
+          timestamp:
+            item.timestamp != null && isFinite(Number(item.timestamp))
+              ? Number(item.timestamp)
+              : null,
+          quality_score: quality.score,
+          quality_percent: quality.percent,
+          score: quality.score,
+          quality_value_source: quality.source,
+          quality_missing_reason: item.quality_missing_reason || "",
+          sample_count: sample.value,
+          sample_count_source: sample.source,
+          processed_messages:
+            item.processed_messages != null && isFinite(Number(item.processed_messages))
+              ? Number(item.processed_messages)
+              : 0,
+          filtered_count:
+            item.filtered_count != null && isFinite(Number(item.filtered_count))
+              ? Number(item.filtered_count)
+              : 0,
+          message_count:
+            item.message_count != null && isFinite(Number(item.message_count))
+              ? Number(item.message_count)
+              : 0,
+          success: Boolean(item.success),
+          batch_name: item.batch_name || "",
+        };
+      });
+  },
+
+  normalizePatternsPayload(data) {
+    var payload = Object.assign({}, data || {});
+    var topicPreferences = Array.isArray(payload.topic_preferences)
+      ? payload.topic_preferences
+      : Array.isArray(payload.topic_patterns)
+        ? payload.topic_patterns
+        : [];
+    payload.emotion_patterns = Array.isArray(payload.emotion_patterns)
+      ? payload.emotion_patterns
+      : [];
+    payload.language_patterns = Array.isArray(payload.language_patterns)
+      ? payload.language_patterns
+      : [];
+    payload.topic_preferences = topicPreferences;
+    payload.topic_patterns = topicPreferences;
+    return payload;
+  },
+
+  getPatternLabel(item) {
+    if (typeof item === "string") {
+      var text = item.trim();
+      if (!text) return "";
+      if (
+        (text[0] === "{" || text[0] === "[") &&
+        (text[text.length - 1] === "}" || text[text.length - 1] === "]")
+      ) {
+        try {
+          return this.getPatternLabel(JSON.parse(text));
+        } catch (e) {
+          return "";
+        }
+      }
+      return text;
+    }
+    if (!item || typeof item !== "object") return "";
+    var keys = ["display_name", "name", "pattern", "style", "topic", "label", "text"];
+    for (var i = 0; i < keys.length; i += 1) {
+      var value = item[keys[i]];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+    return "";
+  },
+
+  getPatternNumericValue(item) {
+    if (!item || typeof item !== "object") return null;
+    var source = item.value_source || null;
+    var rawValue = null;
+    if (item.numeric_value != null) {
+      rawValue = item.numeric_value;
+    } else if (item.value != null) {
+      rawValue = item.value;
+      source = source || "value";
+    } else if (item.count != null) {
+      rawValue = item.count;
+      source = source || "count";
+    } else if (item.usage_count != null) {
+      rawValue = item.usage_count;
+      source = source || "usage_count";
+    } else if (item.score != null) {
+      rawValue = item.score;
+      source = source || "score";
+    } else if (item.confidence != null) {
+      rawValue = item.confidence;
+      source = source || "confidence";
+    } else if (item.weight != null) {
+      rawValue = item.weight;
+      source = source || "weight";
+    }
+    if (rawValue == null) return null;
+    var numeric = Number(rawValue);
+    if (!isFinite(numeric)) return null;
+    if (
+      source === "score" ||
+      source === "confidence" ||
+      source === "weight"
+    ) {
+      if (numeric > 0 && numeric <= 1) numeric = numeric * 100;
+    }
+    return Math.round(numeric);
+  },
+
+  getProgressLabel(item) {
+    if (!item || typeof item !== "object") return "未知";
+    if (item.label) return String(item.label);
+    if (item.batch_name) return String(item.batch_name);
+    if (item.group_id) return "群组" + item.group_id;
+    if (item.timestamp != null) {
+      var ts = Number(item.timestamp);
+      if (isFinite(ts) && ts > 0) {
+        return new Date(ts > 1e12 ? ts : ts * 1000).toLocaleDateString();
+      }
+    }
+    return "未知";
+  },
+
+  getProgressQualityValue(item) {
+    if (!item || typeof item !== "object") {
+      return { score: null, percent: null, source: "missing" };
+    }
+    if (item.quality_percent != null) {
+      var numericPercent = Number(item.quality_percent);
+      if (isFinite(numericPercent)) {
+        var normalizedPercent =
+          numericPercent > 0 && numericPercent <= 1
+            ? numericPercent * 100
+            : numericPercent;
+        return {
+          score: normalizedPercent / 100,
+          percent: Math.round(normalizedPercent * 10) / 10,
+          source: "quality_percent",
+        };
+      }
+    }
+    var keys = ["quality_score", "score"];
+    for (var i = 0; i < keys.length; i += 1) {
+      var key = keys[i];
+      if (item[key] == null) continue;
+      var numericScore = Number(item[key]);
+      if (!isFinite(numericScore)) continue;
+      var normalized =
+        numericScore > 1 ? numericScore : numericScore * 100;
+      return {
+        score: normalized / 100,
+        percent: Math.round(normalized * 10) / 10,
+        source: key,
+      };
+    }
+    return {
+      score: null,
+      percent: null,
+      source: item.quality_value_source || "missing",
+    };
+  },
+
+  getProgressSampleCount(item) {
+    if (!item || typeof item !== "object") {
+      return { value: 0, source: "unavailable" };
+    }
+    var keys = [
+      "sample_count",
+      "filtered_count",
+      "message_count",
+      "processed_messages",
+      "total_samples",
+    ];
+    for (var i = 0; i < keys.length; i += 1) {
+      var key = keys[i];
+      if (item[key] == null) continue;
+      var numericValue = Number(item[key]);
+      if (!isFinite(numericValue)) continue;
+      return { value: Math.max(0, Math.round(numericValue)), source: key };
+    }
+    return { value: 0, source: "unavailable" };
+  },
+
+  getPatternPercent(item) {
+    if (!item || typeof item !== "object") return null;
+    var rawValue = null;
+    if (item.confidence != null) {
+      rawValue = item.confidence;
+    } else if (item.score != null) {
+      rawValue = item.score;
+    } else {
+      return null;
+    }
+    var numeric = Number(rawValue);
+    if (!isFinite(numeric)) return null;
+    if (numeric > 0 && numeric <= 1) numeric = numeric * 100;
+    return Math.round(numeric * 10) / 10;
+  },
+};
+
 window.AppStyleLearning = {
   props: { app: Object },
 
@@ -33,7 +288,7 @@ window.AppStyleLearning = {
             <div class="stat-label">平均置信度</div>
           </div>
           <div class="stat-card">
-            <div class="stat-number">{{ formatNum(styleResults.total_samples) }}</div>
+            <div class="stat-number">{{ formatSampleTotal(styleResults) }}</div>
             <div class="stat-label">原始消息总数</div>
           </div>
           <div class="stat-card">
@@ -99,9 +354,9 @@ window.AppStyleLearning = {
                 <div v-for="(item, idx) in patterns.emotion_patterns" :key="'ep'+idx"
                   style="padding:6px 10px;margin-bottom:4px;background:#f5f0ff;border-radius:6px;font-size:12px;color:#6750a4;">
                   <i class="material-icons" style="font-size:13px;vertical-align:-2px;margin-right:4px;">mood</i>
-                  {{ typeof item === 'string' ? item : (item.name || item.pattern || JSON.stringify(item)) }}
-                  <span v-if="item.score || item.confidence" style="float:right;color:#9c88c9;font-size:11px;">
-                    {{ formatPercent(item.score || item.confidence) }}
+                  {{ getPatternLabel(item) || '未知模式' }}
+                  <span v-if="getPatternPercent(item) != null" style="float:right;color:#9c88c9;font-size:11px;">
+                    {{ formatPercent(getPatternPercent(item)) }}
                   </span>
                 </div>
               </div>
@@ -115,9 +370,9 @@ window.AppStyleLearning = {
                 <div v-for="(item, idx) in patterns.language_patterns" :key="'lp'+idx"
                   style="padding:6px 10px;margin-bottom:4px;background:#e8f5e9;border-radius:6px;font-size:12px;color:#2e7d32;">
                   <i class="material-icons" style="font-size:13px;vertical-align:-2px;margin-right:4px;">translate</i>
-                  {{ typeof item === 'string' ? item : (item.name || item.pattern || JSON.stringify(item)) }}
-                  <span v-if="item.score || item.confidence" style="float:right;color:#66bb6a;font-size:11px;">
-                    {{ formatPercent(item.score || item.confidence) }}
+                  {{ getPatternLabel(item) || '未知风格' }}
+                  <span v-if="getPatternPercent(item) != null" style="float:right;color:#66bb6a;font-size:11px;">
+                    {{ formatPercent(getPatternPercent(item)) }}
                   </span>
                 </div>
               </div>
@@ -131,9 +386,9 @@ window.AppStyleLearning = {
                 <div v-for="(item, idx) in patterns.topic_patterns" :key="'tp'+idx"
                   style="padding:6px 10px;margin-bottom:4px;background:#fff3e0;border-radius:6px;font-size:12px;color:#e65100;">
                   <i class="material-icons" style="font-size:13px;vertical-align:-2px;margin-right:4px;">topic</i>
-                  {{ typeof item === 'string' ? item : (item.name || item.pattern || JSON.stringify(item)) }}
-                  <span v-if="item.score || item.confidence" style="float:right;color:#ffb74d;font-size:11px;">
-                    {{ formatPercent(item.score || item.confidence) }}
+                  {{ getPatternLabel(item) || '未知主题' }}
+                  <span v-if="getPatternPercent(item) != null" style="float:right;color:#ffb74d;font-size:11px;">
+                    {{ formatPercent(getPatternPercent(item)) }}
                   </span>
                 </div>
               </div>
@@ -243,16 +498,29 @@ window.AppStyleLearning = {
   methods: {
     /* ---------- 工具函数 ---------- */
     formatNum(n) {
-      if (n == null) return "0";
+      if (n == null) return "--";
       n = Number(n);
+      if (!isFinite(n)) return "--";
       if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
       if (n >= 1000) return (n / 1000).toFixed(1) + "K";
       return String(n);
     },
 
+    formatSampleTotal(results) {
+      if (
+        results &&
+        results.raw_message_count_source === "unavailable" &&
+        Number(results.total_samples || 0) === 0
+      ) {
+        return "暂无可靠数据";
+      }
+      return this.formatNum(results ? results.total_samples : null);
+    },
+
     formatPercent(v) {
-      if (v == null) return "0%";
+      if (v == null) return "--";
       var num = Number(v);
+      if (!isFinite(num)) return "--";
       // If value is already 0-1 range, convert to percentage
       if (num > 0 && num <= 1) num = num * 100;
       return num.toFixed(1) + "%";
@@ -301,6 +569,18 @@ window.AppStyleLearning = {
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+    },
+
+    getPatternLabel(item) {
+      return window.StyleLearningDataUtils.getPatternLabel(item);
+    },
+
+    getPatternNumericValue(item) {
+      return window.StyleLearningDataUtils.getPatternNumericValue(item);
+    },
+
+    getPatternPercent(item) {
+      return window.StyleLearningDataUtils.getPatternPercent(item);
     },
 
     /* ---------- 注册 ECharts 主题 ---------- */
@@ -402,18 +682,13 @@ window.AppStyleLearning = {
           credentials: "include",
         });
         var data = await resp.json();
-        // Normalize: backend returns { statistics: {...}, style_progress: [...] }
-        // Flatten statistics into top-level for stat cards
-        if (data && data.statistics) {
-          data.style_types_count = data.statistics.unique_styles || 0;
-          data.avg_confidence = data.statistics.avg_confidence || 0;
-          data.total_samples = data.statistics.total_samples || 0;
-          data.latest_update = data.statistics.latest_update || null;
-        }
-        this.styleResults = data || {};
+        this.styleResults = window.StyleLearningDataUtils.normalizeResultsPayload(
+          data,
+        );
       } catch (e) {
         console.error("[StyleLearning] loadStyleData error:", e);
-        this.styleResults = {};
+        this.styleResults =
+          window.StyleLearningDataUtils.normalizeResultsPayload({});
       }
     },
 
@@ -423,14 +698,12 @@ window.AppStyleLearning = {
           credentials: "include",
         });
         var data = await resp.json();
-        // Normalize: backend returns topic_preferences, frontend expects topic_patterns
-        if (data && data.topic_preferences && !data.topic_patterns) {
-          data.topic_patterns = data.topic_preferences;
-        }
-        this.patterns = data || {};
+        this.patterns =
+          window.StyleLearningDataUtils.normalizePatternsPayload(data);
       } catch (e) {
         console.error("[StyleLearning] loadPatterns error:", e);
-        this.patterns = {};
+        this.patterns =
+          window.StyleLearningDataUtils.normalizePatternsPayload({});
       }
     },
 
@@ -526,20 +799,31 @@ window.AppStyleLearning = {
         return;
       }
 
-      var styleProgress = data.style_progress;
-      var labels = styleProgress.map(function (item) {
-        if (item.group_id) return "群组" + item.group_id;
-        if (item.timestamp)
-          return new Date(item.timestamp * 1000).toLocaleDateString();
-        return "未知";
+      var styleProgress = window.StyleLearningDataUtils.normalizeProgressItems(
+        data.style_progress,
+      );
+      var qualityProgress = styleProgress.filter(function (item) {
+        return item.quality_percent != null;
       });
-      var scores = styleProgress.map(function (item) {
-        return Math.round((item.quality_score || 0) * 100);
-      });
-      var samples = styleProgress.map(function (item) {
-        return (
-          item.filtered_count || item.message_count || item.total_samples || 0
+      if (qualityProgress.length === 0) {
+        var hasHistoricalGap = styleProgress.some(function (item) {
+          return item.quality_value_source === "historical_missing";
+        });
+        chart.setOption(
+          this.emptyOption(hasHistoricalGap ? "历史数据缺失" : "暂无质量分数数据"),
+          true,
         );
+        return;
+      }
+
+      var labels = qualityProgress.map(function (item) {
+        return item.label || "未知";
+      });
+      var scores = qualityProgress.map(function (item) {
+        return item.quality_percent;
+      });
+      var samples = qualityProgress.map(function (item) {
+        return item.sample_count;
       });
 
       chart.setOption(
@@ -770,6 +1054,162 @@ window.AppStyleLearning = {
     },
 
     /* ---------- 4. 话题偏好 - 饼图 ---------- */
+    initEmotionPatterns() {
+      var chart =
+        this.chartInstances["emotionPatternsChart"] ||
+        this.initChart("emotionPatternsChart");
+      if (!chart) return;
+
+      var emotionPatterns = this.patterns.emotion_patterns || [];
+      if (emotionPatterns.length === 0) {
+        chart.setOption(this.emptyOption("鏆傛棤鎯呮劅妯″紡鏁版嵁"), true);
+        return;
+      }
+
+      var self = this;
+      var chartData = emotionPatterns
+        .map(function (item) {
+          return {
+            name: self.getPatternLabel(item),
+            value: self.getPatternNumericValue(item),
+          };
+        })
+        .filter(function (item) {
+          return item.name && item.value != null;
+        });
+
+      if (chartData.length === 0) {
+        chart.setOption(this.emptyOption("鏆傛棤鎯呮劅妯″紡鏁版嵁"), true);
+        return;
+      }
+
+      chart.setOption(
+        {
+          tooltip: {
+            trigger: "item",
+          },
+          radar: {
+            indicator: chartData.map(function (item) {
+              return { name: item.name, max: 100 };
+            }),
+            center: ["50%", "55%"],
+            radius: "60%",
+            shape: "polygon",
+            splitArea: {
+              areaStyle: {
+                color: ["rgba(25,118,210,0.02)", "rgba(25,118,210,0.05)"],
+              },
+            },
+            axisName: { color: "#757575", fontSize: 11 },
+          },
+          series: [
+            {
+              name: "鎯呮劅妯″紡",
+              type: "radar",
+              data: [
+                {
+                  value: chartData.map(function (item) {
+                    return item.value;
+                  }),
+                  name: "鎯呮劅缁村害",
+                  symbol: "circle",
+                  symbolSize: 6,
+                  itemStyle: { color: "#9c27b0" },
+                  lineStyle: { color: "#9c27b0", width: 2 },
+                  areaStyle: { color: "rgba(156, 39, 176, 0.2)" },
+                },
+              ],
+            },
+          ],
+        },
+        true,
+      );
+    },
+
+    initLanguageStyle() {
+      var chart =
+        this.chartInstances["languageStyleChart"] ||
+        this.initChart("languageStyleChart");
+      if (!chart) return;
+
+      var languagePatterns = this.patterns.language_patterns || [];
+      if (languagePatterns.length === 0) {
+        chart.setOption(this.emptyOption("鏆傛棤璇█椋庢牸鏁版嵁"), true);
+        return;
+      }
+
+      var self = this;
+      var chartData = languagePatterns
+        .map(function (item) {
+          return {
+            name: self.getPatternLabel(item),
+            value: self.getPatternNumericValue(item),
+          };
+        })
+        .filter(function (item) {
+          return item.name && item.value != null;
+        });
+
+      if (chartData.length === 0) {
+        chart.setOption(this.emptyOption("鏆傛棤璇█椋庢牸鏁版嵁"), true);
+        return;
+      }
+
+      chart.setOption(
+        {
+          tooltip: {
+            trigger: "axis",
+            axisPointer: { type: "shadow" },
+          },
+          grid: {
+            left: "3%",
+            right: "4%",
+            bottom: "3%",
+            top: "10%",
+            containLabel: true,
+          },
+          xAxis: {
+            type: "category",
+            data: chartData.map(function (item) {
+              return item.name;
+            }),
+            axisLabel: {
+              rotate: chartData.length > 5 ? 30 : 0,
+              fontSize: 11,
+            },
+          },
+          yAxis: { type: "value", name: "特征值" },
+          series: [
+            {
+              name: "璇█鐗瑰緛",
+              type: "bar",
+              data: chartData.map(function (item) {
+                return item.value;
+              }),
+              barMaxWidth: 40,
+              itemStyle: {
+                color: window.echarts
+                  ? new window.echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                      { offset: 0, color: "#4caf50" },
+                      { offset: 1, color: "#81c784" },
+                    ])
+                  : "#4caf50",
+                borderRadius: [4, 4, 0, 0],
+              },
+              emphasis: {
+                itemStyle: {
+                  shadowBlur: 10,
+                  shadowOffsetX: 0,
+                  shadowColor: "rgba(0,0,0,0.3)",
+                },
+              },
+            },
+          ],
+        },
+        true,
+      );
+    },
+
     initTopicPreferences() {
       var chart =
         this.chartInstances["topicPreferencesChart"] ||
@@ -782,19 +1222,24 @@ window.AppStyleLearning = {
         return;
       }
 
-      var pieData = topicPatterns.map(function (item) {
-        var name =
-          typeof item === "string" ? item : item.name || item.pattern || "未知";
-        var value = 0;
-        if (typeof item === "object" && item !== null) {
-          value =
-            item.score || item.confidence || item.value || item.count || 1;
-          if (value > 0 && value <= 1) value = Math.round(value * 100);
-        } else {
-          value = 1;
-        }
-        return { name: name, value: value };
-      });
+      var self = this;
+      var pieData = topicPatterns
+        .map(function (item) {
+          var name = self.getPatternLabel(item);
+          var value = self.getPatternNumericValue(item);
+          return {
+            name: name || "未知主题",
+            value: value == null ? 1 : value,
+          };
+        })
+        .filter(function (item) {
+          return item.name;
+        });
+
+      if (pieData.length === 0) {
+        chart.setOption(this.emptyOption("历史模式数据缺失"), true);
+        return;
+      }
 
       chart.setOption(
         {
